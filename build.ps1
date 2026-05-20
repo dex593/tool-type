@@ -45,6 +45,16 @@ if ($LASTEXITCODE -ne 0) {
     throw "Build resource thất bại với mã $LASTEXITCODE"
 }
 
+$compilerInfo = (& cmd.exe /d /s /c "`"$mingw`" -v 2>&1") -join "`n"
+$runtimeLinkFlags = @("-static-libgcc", "-static-libstdc++")
+
+if ($compilerInfo -match "Thread model:\s*posix") {
+    # MSYS2 MinGW64 uses the POSIX thread runtime. Without full static
+    # runtime linking, the GitHub Actions artifact can depend on
+    # libwinpthread-1.dll and fail on normal user machines.
+    $runtimeLinkFlags = @("-static") + $runtimeLinkFlags
+}
+
 & $mingw `
     -std=c++17 `
     -O3 `
@@ -68,8 +78,7 @@ if ($LASTEXITCODE -ne 0) {
     -lgdi32 `
     -luser32 `
     -lwininet `
-    -static-libgcc `
-    -static-libstdc++
+    $runtimeLinkFlags
 
 if ($LASTEXITCODE -ne 0) {
     throw "Build thất bại với mã $LASTEXITCODE"

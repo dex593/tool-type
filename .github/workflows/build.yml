@@ -39,6 +39,17 @@ jobs:
         shell: pwsh
         run: Get-FileHash .\ToolType.exe -Algorithm SHA256 | Format-List
 
+      - name: Check runtime DLL dependencies
+        shell: pwsh
+        run: |
+          $dump = & objdump -p .\ToolType.exe
+          $dlls = $dump | Select-String 'DLL Name:' | ForEach-Object { $_.Line.Trim() }
+          $dlls
+          $unexpected = $dlls | Where-Object { $_ -match 'lib(winpthread|gcc|stdc\+\+)|zlib|libz' }
+          if ($unexpected) {
+            throw "Executable still depends on MinGW runtime DLLs: $($unexpected -join ', ')"
+          }
+
       - name: Upload executable
         uses: actions/upload-artifact@v4
         with:
