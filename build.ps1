@@ -47,13 +47,17 @@ if ($LASTEXITCODE -ne 0) {
 
 $compilerInfo = (& cmd.exe /d /s /c "`"$mingw`" -v 2>&1") -join "`n"
 $runtimeLinkFlags = @("-static-libgcc", "-static-libstdc++")
+$libraryLinkFlags = @("-Wl,-Bstatic", "-lz", "-Wl,-Bdynamic")
 
-if ($compilerInfo -match "Thread model:\s*posix") {
+if ($env:TOOLTYPE_FULL_STATIC -eq "1" -or $compilerInfo -match "Thread model:\s*posix") {
     # MSYS2 MinGW64 uses the POSIX thread runtime. Without full static
     # runtime linking, the GitHub Actions artifact can depend on
     # libwinpthread-1.dll and fail on normal user machines.
     $runtimeLinkFlags = @("-static") + $runtimeLinkFlags
+    $libraryLinkFlags = @("-lz")
 }
+
+Write-Host "Runtime link flags: $($runtimeLinkFlags -join ' ')"
 
 & $mingw `
     -std=c++17 `
@@ -71,9 +75,7 @@ if ($compilerInfo -match "Thread model:\s*posix") {
     -o ToolType.exe `
     "-Wl,--dynamicbase" `
     "-Wl,--nxcompat" `
-    "-Wl,-Bstatic" `
-    -lz `
-    "-Wl,-Bdynamic" `
+    $libraryLinkFlags `
     -lcomdlg32 `
     -lgdi32 `
     -luser32 `

@@ -33,6 +33,8 @@ jobs:
 
       - name: Build
         shell: pwsh
+        env:
+          TOOLTYPE_FULL_STATIC: "1"
         run: powershell -ExecutionPolicy Bypass -File .\build.ps1
 
       - name: Show SHA256
