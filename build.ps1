@@ -78,6 +78,7 @@ Write-Host "Runtime link flags: $($runtimeLinkFlags -join ' ')"
     $libraryLinkFlags `
     -lcomdlg32 `
     -lgdi32 `
+    -lshell32 `
     -luser32 `
     -lwininet `
     $runtimeLinkFlags

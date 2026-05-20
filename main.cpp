@@ -8,6 +8,7 @@
 
 #include <windows.h>
 #include <commdlg.h>
+#include <shellapi.h>
 #include <wininet.h>
 #include <zlib.h>
 
@@ -50,6 +51,15 @@ constexpr COLORREF kQuoteTextColor = RGB(255, 236, 145);
 constexpr COLORREF kTooltipBackColor = RGB(18, 18, 18);
 constexpr COLORREF kTooltipBorderColor = RGB(255, 255, 255);
 constexpr UINT WM_APP_PASTE_NEXT = WM_APP + 24;
+constexpr UINT WM_APP_UPDATE_CHECK_DONE = WM_APP + 25;
+
+constexpr const wchar_t* kToolVersion = L"1.0";
+constexpr const wchar_t* kUpdateCheckUrl =
+    L"https://github.com/dex593/tool-type/raw/refs/heads/master/check.ini";
+constexpr const wchar_t* kLatestVersionMessage =
+    L"Bạn đang sử dụng phiên bản mới nhất.";
+constexpr const wchar_t* kUpdateAvailableMessage =
+    L"Đã có phiên bản mới, click để tải ngay.";
 
 constexpr int ID_LIST = 1001;
 constexpr int ID_ADD = 1101;
@@ -64,6 +74,11 @@ constexpr int ID_GUIDE = 1109;
 constexpr int ID_DEFAULT_HOTKEY = 1110;
 constexpr int ID_STATUS = 1201;
 constexpr int IDI_TOOLTYPE = 101;
+
+struct UpdateCheckResult {
+    bool updateAvailable = false;
+    std::wstring downloadUrl;
+};
 
 uint16_t ReadU16(const std::vector<uint8_t>& data, size_t off) {
     if (off + 2 > data.size()) return 0;
@@ -242,6 +257,74 @@ std::wstring TrimCopy(const std::wstring& text) {
     size_t last = text.size();
     while (last > first && iswspace(text[last - 1])) --last;
     return text.substr(first, last - first);
+}
+
+std::wstring LowerAsciiCopy(std::wstring text) {
+    for (auto& ch : text) {
+        if (ch >= L'A' && ch <= L'Z') {
+            ch = static_cast<wchar_t>(ch - L'A' + L'a');
+        }
+    }
+    return text;
+}
+
+bool IsHttpUrl(const std::wstring& url) {
+    return url.rfind(L"https://", 0) == 0 || url.rfind(L"http://", 0) == 0;
+}
+
+bool ReadUpdateIni(const std::wstring& text, std::wstring& version, std::wstring& downloadUrl) {
+    version.clear();
+    downloadUrl.clear();
+    for (const auto& rawLine : SplitLines(text)) {
+        std::wstring line = TrimCopy(rawLine);
+        if (line.empty() || line[0] == L';' || line[0] == L'#' || line[0] == L'[') {
+            continue;
+        }
+
+        size_t eq = line.find(L'=');
+        if (eq == std::wstring::npos) continue;
+
+        std::wstring key = LowerAsciiCopy(TrimCopy(line.substr(0, eq)));
+        std::wstring value = TrimCopy(line.substr(eq + 1));
+        if (key == L"version") {
+            version = value;
+        } else if (key == L"download" || key == L"download_url" ||
+                   key == L"downloadurl" || key == L"url" || key == L"link") {
+            downloadUrl = value;
+        }
+    }
+    return !version.empty() && IsHttpUrl(downloadUrl);
+}
+
+std::vector<unsigned long long> ParseVersionParts(const std::wstring& version) {
+    std::vector<unsigned long long> parts;
+    unsigned long long value = 0;
+    bool inNumber = false;
+    for (wchar_t ch : version) {
+        if (ch >= L'0' && ch <= L'9') {
+            inNumber = true;
+            value = value * 10 + static_cast<unsigned long long>(ch - L'0');
+        } else if (inNumber) {
+            parts.push_back(value);
+            value = 0;
+            inNumber = false;
+        }
+    }
+    if (inNumber) parts.push_back(value);
+    return parts;
+}
+
+int CompareVersions(const std::wstring& left, const std::wstring& right) {
+    std::vector<unsigned long long> a = ParseVersionParts(left);
+    std::vector<unsigned long long> b = ParseVersionParts(right);
+    size_t count = std::max(a.size(), b.size());
+    for (size_t i = 0; i < count; ++i) {
+        unsigned long long av = i < a.size() ? a[i] : 0;
+        unsigned long long bv = i < b.size() ? b[i] : 0;
+        if (av > bv) return 1;
+        if (av < bv) return -1;
+    }
+    return 0;
 }
 
 enum class TextLineKind { Blank, Comment, Star, Dash, Quote, Normal };
@@ -425,6 +508,88 @@ bool ReadFileBytes(const std::wstring& path, std::vector<uint8_t>& out, std::wst
     }
     CloseHandle(file);
     return true;
+}
+
+bool DownloadUpdateBytes(const std::wstring& url, std::vector<uint8_t>& out) {
+    out.clear();
+    std::wstring userAgent = L"ToolType/";
+    userAgent += kToolVersion;
+    HINTERNET internet = InternetOpenW(userAgent.c_str(), INTERNET_OPEN_TYPE_PRECONFIG,
+                                       nullptr, nullptr, 0);
+    if (!internet) return false;
+
+    DWORD timeoutMs = 7000;
+    InternetSetOptionW(internet, INTERNET_OPTION_CONNECT_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+    InternetSetOptionW(internet, INTERNET_OPTION_SEND_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+    InternetSetOptionW(internet, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+
+    DWORD flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE |
+                  INTERNET_FLAG_NO_UI | INTERNET_FLAG_PRAGMA_NOCACHE;
+    HINTERNET request = InternetOpenUrlW(internet, url.c_str(), nullptr, 0, flags, 0);
+    if (!request) {
+        InternetCloseHandle(internet);
+        return false;
+    }
+
+    DWORD status = 0;
+    DWORD statusSize = sizeof(status);
+    if (HttpQueryInfoW(request, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER,
+                       &status, &statusSize, nullptr) && status >= 400) {
+        InternetCloseHandle(request);
+        InternetCloseHandle(internet);
+        return false;
+    }
+
+    uint8_t buffer[16 * 1024];
+    for (;;) {
+        DWORD read = 0;
+        if (!InternetReadFile(request, buffer, sizeof(buffer), &read)) {
+            InternetCloseHandle(request);
+            InternetCloseHandle(internet);
+            return false;
+        }
+        if (read == 0) break;
+        if (out.size() + read > 256u * 1024u) {
+            InternetCloseHandle(request);
+            InternetCloseHandle(internet);
+            return false;
+        }
+        out.insert(out.end(), buffer, buffer + read);
+    }
+
+    InternetCloseHandle(request);
+    InternetCloseHandle(internet);
+    return !out.empty();
+}
+
+DWORD WINAPI UpdateCheckThreadProc(LPVOID rawArgs) {
+    HWND hwnd = static_cast<HWND>(rawArgs);
+
+    auto* result = new UpdateCheckResult();
+    std::vector<uint8_t> bytes;
+    if (DownloadUpdateBytes(kUpdateCheckUrl, bytes)) {
+        std::wstring text = DecodeTextBytes(bytes);
+        std::wstring remoteVersion;
+        std::wstring downloadUrl;
+        if (ReadUpdateIni(text, remoteVersion, downloadUrl) &&
+            CompareVersions(remoteVersion, kToolVersion) > 0) {
+            result->updateAvailable = true;
+            result->downloadUrl = downloadUrl;
+        }
+    }
+
+    if (!hwnd || !PostMessageW(hwnd, WM_APP_UPDATE_CHECK_DONE, 0,
+                               reinterpret_cast<LPARAM>(result))) {
+        delete result;
+    }
+    return 0;
+}
+
+void StartUpdateCheck(HWND hwnd) {
+    HANDLE thread = CreateThread(nullptr, 0, UpdateCheckThreadProc, hwnd, 0, nullptr);
+    if (thread) {
+        CloseHandle(thread);
+    }
 }
 
 std::wstring ExtensionLower(const std::wstring& path) {
@@ -807,6 +972,7 @@ public:
 
         ShowWindow(hwnd_, nCmdShow);
         UpdateWindow(hwnd_);
+        StartUpdateCheck(hwnd_);
         return true;
     }
 
@@ -1091,6 +1257,15 @@ private:
             case WM_APP_PASTE_NEXT:
                 PasteCurrentAndAdvance(reinterpret_cast<HWND>(lp));
                 return 0;
+            case WM_APP_UPDATE_CHECK_DONE:
+                HandleUpdateCheckResult(reinterpret_cast<UpdateCheckResult*>(lp));
+                return 0;
+            case WM_SETCURSOR:
+                if (reinterpret_cast<HWND>(wp) == status_ && !updateDownloadUrl_.empty()) {
+                    SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                    return TRUE;
+                }
+                break;
             case WM_DESTROY:
                 UninstallHook();
                 PostQuitMessage(0);
@@ -1133,8 +1308,8 @@ private:
         ShowWindow(hotkeyButton_, SW_HIDE);
         ShowWindow(guideButton_, SW_HIDE);
 
-        status_ = CreateWindowExW(0, L"STATIC", L"Bạn đang dùng phiên bản mới nhất!",
-                                  WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 0, 0, 0,
+        status_ = CreateWindowExW(0, L"STATIC", kLatestVersionMessage,
+                                  WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOTIFY, 0, 0, 0, 0,
                                   hwnd_, reinterpret_cast<HMENU>(ID_STATUS), instance_, nullptr);
         tooltip_ = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
                                    L"ToolTypeTooltip", nullptr, WS_POPUP | WS_DISABLED,
@@ -1797,6 +1972,9 @@ private:
 
     void OnCommand(int id) {
         switch (id) {
+            case ID_STATUS:
+                OpenUpdateDownloadUrl();
+                break;
             case ID_ADD:
                 ChooseAndLoadFile();
                 break;
@@ -2113,6 +2291,27 @@ private:
     void SetStatus(const std::wstring& text) {
         SetWindowTextW(status_, text.c_str());
         InvalidateRect(status_, nullptr, TRUE);
+    }
+
+    void HandleUpdateCheckResult(UpdateCheckResult* result) {
+        if (!result) return;
+        if (result->updateAvailable && IsHttpUrl(result->downloadUrl)) {
+            updateDownloadUrl_ = result->downloadUrl;
+            SetStatus(kUpdateAvailableMessage);
+        } else {
+            updateDownloadUrl_.clear();
+            SetStatus(kLatestVersionMessage);
+        }
+        delete result;
+    }
+
+    void OpenUpdateDownloadUrl() {
+        if (updateDownloadUrl_.empty()) return;
+        HINSTANCE opened = ShellExecuteW(hwnd_, L"open", updateDownloadUrl_.c_str(),
+                                         nullptr, nullptr, SW_SHOWNORMAL);
+        if (reinterpret_cast<INT_PTR>(opened) <= 32) {
+            SetStatus(L"Không mở được link tải bản mới.");
+        }
     }
 
     void ShowEndOfTextPopup() {
@@ -2619,6 +2818,7 @@ private:
     std::wstring tooltipText_;
     std::wstring currentFile_;
     std::wstring savedFile_;
+    std::wstring updateDownloadUrl_;
     int selectedIndex_ = 0;
     int topIndex_ = 0;
     int horizontalOffset_ = 0;

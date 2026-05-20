@@ -11,6 +11,7 @@ ToolType là ứng dụng Win32 C++ nhỏ để nạp danh sách dòng từ `.tx
 - Tùy chọn phím paste bất kỳ; mặc định hỗ trợ Tab/F4.
 - On/Off, Pin, Save/Open vị trí đang dùng.
 - Tooltip hiện full câu khi rê chuột lên từng dòng.
+- Tự kiểm tra bản mới qua `check.ini` công khai khi mở tool.
 - Giao diện Win32 nhỏ gọn, nền đen trong suốt, có icon và metadata exe.
 
 ## Build local
@@ -38,7 +39,30 @@ Mỗi lần push/pull request hoặc chạy thủ công bằng `workflow_dispatc
 1. Checkout source.
 2. Cài MSYS2 MinGW-w64.
 3. Chạy `build.ps1`.
-4. Upload artifact `ToolType.exe`.
+4. Upload artifact gồm `ToolType.exe` và `check.ini`.
+5. Với push lên `master`/`main` hoặc chạy thủ công, tạo/cập nhật GitHub Release `v<version>` kèm release notes, SHA256 và asset tải xuống.
+
+## Cập nhật phiên bản
+
+ToolType đang dùng version `1.0.0.0` trong code/resource. File `check.ini` ở repo chứa:
+
+```ini
+[update]
+version=1.0.0.0
+download=https://github.com/dex593/tool-type/releases/latest/download/ToolType.exe
+```
+
+Khi mở app, ToolType tải `https://github.com/dex593/tool-type/raw/refs/heads/master/check.ini`.
+Nếu `version` trong file này cao hơn version trong code, status sẽ hiện:
+`Đã có phiên bản mới, click để tải ngay.` Người dùng bấm vào dòng status để mở link `download`.
+Nếu chưa có bản mới hoặc không tải được file kiểm tra, status sẽ là:
+`Bạn đang sử dụng phiên bản mới nhất.`
+
+Khi phát hành bản mới, hãy bump đồng bộ:
+
+- `kToolVersion` trong `main.cpp`;
+- `FILEVERSION`, `PRODUCTVERSION`, `FileVersion`, `ProductVersion` trong `resource.rc`;
+- `version=` trong `check.ini`.
 
 ## Lưu ý bảo mật/antivirus
 
