@@ -52,13 +52,16 @@ jobs:
             throw "Executable still depends on MinGW runtime DLLs: $($unexpected -join ', ')"
           }
 
-      - name: Upload executable
+      - name: Package release ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive -Path .\ToolType.exe -DestinationPath .\ToolType.zip -Force
+
+      - name: Upload packaged executable
         uses: actions/upload-artifact@v4
         with:
           name: ToolType-windows
-          path: |
-            ToolType.exe
-            check.ini
+          path: ToolType.zip
           if-no-files-found: error
 
       - name: Publish GitHub Release
@@ -79,7 +82,10 @@ jobs:
           }
 
           $tag = "v$version"
-          $sha256 = (Get-FileHash .\ToolType.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $zipPath = ".\ToolType.zip"
+          if (-not (Test-Path $zipPath)) {
+            throw "Khong tim thay ToolType.zip"
+          }
           $notesPath = "release-notes.md"
 
           @"
@@ -89,29 +95,26 @@ jobs:
 
           ### Tải xuống
 
-          - `ToolType.exe` — bản chạy Windows mới nhất.
-          - `check.ini` — file cấu hình cập nhật công khai cho cơ chế auto-check.
-
-          ### Xác minh
-
-          - SHA256 (`ToolType.exe`): `$sha256`
-          - Commit: `$env:GITHUB_SHA`
-
-          ### Ghi chú vận hành
-
-          ToolType kiểm tra `check.ini` trên nhánh `master`. Khi cần phát hành phiên bản mới,
-          hãy bump `version` trong `check.ini` và metadata trong code/resource trước khi build.
+          - Tải `ToolType.zip`, giải nén rồi chạy `ToolType.exe`.
           "@ | Set-Content -Path $notesPath -Encoding UTF8
 
           & gh release view $tag *> $null
           $releaseExists = $LASTEXITCODE -eq 0
 
           if ($releaseExists) {
-            & gh release upload $tag .\ToolType.exe .\check.ini --clobber
+            $existingAssets = @(& gh release view $tag --json assets --jq '.assets[].name')
+            if ($LASTEXITCODE -ne 0) { throw "Read release assets failed" }
+            foreach ($oldAsset in @("ToolType.exe", "check.ini")) {
+              if ($existingAssets -contains $oldAsset) {
+                & gh release delete-asset $tag $oldAsset --yes
+                if ($LASTEXITCODE -ne 0) { throw "Delete old release asset failed: $oldAsset" }
+              }
+            }
+            & gh release upload $tag $zipPath --clobber
             if ($LASTEXITCODE -ne 0) { throw "Upload release assets failed" }
             & gh release edit $tag --title "ToolType $version" --notes-file $notesPath --latest
             if ($LASTEXITCODE -ne 0) { throw "Update release metadata failed" }
           } else {
-            & gh release create $tag .\ToolType.exe .\check.ini --target $env:GITHUB_SHA --title "ToolType $version" --notes-file $notesPath --latest
+            & gh release create $tag $zipPath --target $env:GITHUB_SHA --title "ToolType $version" --notes-file $notesPath --latest
             if ($LASTEXITCODE -ne 0) { throw "Create release failed" }
           }

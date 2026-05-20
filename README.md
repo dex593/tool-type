@@ -39,8 +39,8 @@ Mỗi lần push/pull request hoặc chạy thủ công bằng `workflow_dispatc
 1. Checkout source.
 2. Cài MSYS2 MinGW-w64.
 3. Chạy `build.ps1`.
-4. Upload artifact gồm `ToolType.exe` và `check.ini`.
-5. Với push lên `master`/`main` hoặc chạy thủ công, tạo/cập nhật GitHub Release `v<version>` kèm release notes, SHA256 và asset tải xuống.
+4. Đóng gói `ToolType.exe` vào `ToolType.zip` và upload artifact ZIP.
+5. Với push lên `master`/`main` hoặc chạy thủ công, tạo/cập nhật GitHub Release `v<version>` với release notes gọn và asset `ToolType.zip`.
 
 ## Cập nhật phiên bản
 
@@ -49,7 +49,7 @@ ToolType đang dùng version `1.0.0.0` trong code/resource. File `check.ini` ở
 ```ini
 [update]
 version=1.0.0.0
-download=https://github.com/dex593/tool-type/releases/latest/download/ToolType.exe
+download=https://github.com/dex593/tool-type/releases/latest/download/ToolType.zip
 ```
 
 Khi mở app, ToolType tải `https://github.com/dex593/tool-type/raw/refs/heads/master/check.ini`.
