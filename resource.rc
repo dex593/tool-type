@@ -1,0 +1,40 @@
+#include <windows.h>
+
+#define IDI_TOOLTYPE 101
+
+IDI_TOOLTYPE ICON "icon.ico"
+
+1 RT_MANIFEST "tooltype.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEFLAGSMASK 0x3fL
+#ifdef _DEBUG
+ FILEFLAGS 0x1L
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "ToolType Local Utility\0"
+            VALUE "FileDescription", "Local text line paste helper\0"
+            VALUE "FileVersion", "1.0.0.0\0"
+            VALUE "InternalName", "ToolType\0"
+            VALUE "OriginalFilename", "ToolType.exe\0"
+            VALUE "ProductName", "ToolType\0"
+            VALUE "ProductVersion", "1.0.0.0\0"
+            VALUE "Comments", "User-controlled local helper for pasting prepared text lines\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

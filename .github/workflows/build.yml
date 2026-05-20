@@ -1,0 +1,47 @@
+name: Build ToolType
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows MinGW build
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install MSYS2 MinGW-w64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-zlib
+
+      - name: Add MinGW to PATH
+        shell: pwsh
+        run: |
+          "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Build
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File .\build.ps1
+
+      - name: Show SHA256
+        shell: pwsh
+        run: Get-FileHash .\ToolType.exe -Algorithm SHA256 | Format-List
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: ToolType-windows
+          path: ToolType.exe
+          if-no-files-found: error

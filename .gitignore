@@ -1,0 +1,7 @@
+ToolType.exe
+ToolType.ini
+resource.res
+*.o
+*.obj
+*.log
+.omx/
