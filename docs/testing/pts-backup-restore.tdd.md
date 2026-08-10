@@ -30,6 +30,7 @@
 - Commit `f205161` reproduced a stale `.previous` safety-copy collision that could otherwise be mistaken for the current rollback file.
 - Commit `9b55986` proved that same-version CS6 restore still passed native workspace data through the compatibility normalizer instead of preserving the archive bytes.
 - Commit `2eb9674` reproduced the real-machine failure residue: a stale `WorkSpaces\Essentials` alias with a duplicated closing root/trailing XML survived restore and remained available for CS6 to load.
+- Commit `4ac1273` expanded that RED contract to prefix garbage, mismatched inner tags, XML comments containing tag-like text, and preservation of a valid unplanned counterpart.
 
 ## GREEN implementation
 
@@ -51,6 +52,7 @@
 - Commit `d4f0a7b` aborts before `ReplaceFileW` when its safety-backup path already exists and reports the retained recovery path if rollback itself cannot complete.
 - Commit `e9fbc07` limits workspace-format conversion to an actual cross-version restore, keeping CS6-to-CS6 workspace payloads byte-for-byte.
 - Commit `71cf7ee` inspects legacy same-version counterpart aliases only when they are absent from the archive plan: valid existing workspaces are preserved, absent aliases are not created, and a malformed stale alias is atomically replaced with the restored valid workspace bytes.
+- Commit `bd6f643` replaces the root-string heuristic with a bounded XML structure scanner that handles declarations, comments, CDATA, quoted attributes, balanced nested elements, the required `workspace` element, and clean outer padding before deciding an alias is safe to preserve.
 - Windows path validation rejects traversal, empty/dot segments, control characters, trailing dot/space, and reserved device prefixes before the first period.
 
 ## Regression specification
@@ -70,6 +72,7 @@
 | Same-version workspace variants keep their own bytes instead of overwriting through aliases | `TestSameVersionWorkspaceRestoreKeepsDistinctVariants` | PASS |
 | Native CS6-to-CS6 workspace payloads bypass cross-version normalization | `TestSameVersionCs6WorkspaceRestoreKeepsNativeBytes` | PASS |
 | A malformed legacy counterpart alias is repaired while archive-planned primary variants remain protected | `TestSameVersionCs6RestoreRepairsMalformedLegacyAlias` | PASS |
+| Structurally corrupt workspace XML is rejected while a valid comment and a valid unplanned counterpart are preserved | `TestCs6WorkspaceStructuralValidation`, `TestSameVersionCs6RestoreRepairsMalformedLegacyAlias` | PASS |
 | Cross-version workspace aliases cannot overwrite distinct primary workspace variants | `TestCrossVersionWorkspaceAliasesDoNotOverwritePrimaryEntries` | PASS |
 | Cancelled cross-version restore cannot leave an alias in a future primary workspace path | `TestCancelledCrossVersionRestoreDoesNotAliasOverFuturePrimary` | PASS |
 | Native restore tests request but do not write the real Photoshop Registry path | injected updater in `TestCrossVersionArchiveRestore` | PASS |
