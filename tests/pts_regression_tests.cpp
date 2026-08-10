@@ -166,6 +166,22 @@ void TestPtsDialogLoopPreservesQuitAndDestroysWindow() {
            "Pts dialog loop swallowed the outer application WM_QUIT");
 }
 
+void TestPtsCancellationCommitGateHasSingleWinner() {
+    PtsCancellationHandle committing = CreatePtsCancellationHandle();
+    Expect(BeginPtsCommit(committing), "worker could not enter the backup commit phase");
+    Expect(!RequestPtsCancellation(committing),
+           "late cancellation was accepted after backup commit began");
+    Expect(!IsPtsCancellationRequested(committing),
+           "late cancellation changed a committing operation into cancelled state");
+
+    PtsCancellationHandle cancelling = CreatePtsCancellationHandle();
+    Expect(RequestPtsCancellation(cancelling), "cancellation was not accepted before commit");
+    Expect(!BeginPtsCommit(cancelling),
+           "backup commit started after cancellation had already been accepted");
+    Expect(IsPtsCancellationRequested(cancelling),
+           "accepted cancellation was lost at the commit gate");
+}
+
 void TestAtomicCommitPreservesDestinationAcrossReplaceFailures() {
     namespace fs = std::filesystem;
     fs::path root = fs::temp_directory_path() / L"tooltype-pts-atomic-commit-failures";
@@ -896,6 +912,28 @@ void TestCancelledBackupDeletesIncompleteArchive() {
                                std::istreambuf_iterator<char>());
     Expect(preservedBytes == "previous-valid-backup",
            "cancelled backup destroyed the previous archive");
+    preservedBackup.close();
+
+    PtsCancellationHandle commitRace = CreatePtsCancellationHandle();
+    auto commitRaceCancelled = [commitRace] {
+        return IsPtsCancellationRequested(commitRace);
+    };
+    auto cancelImmediatelyBeforeCommit = [commitRace] {
+        RequestPtsCancellation(commitRace);
+        return BeginPtsCommit(commitRace);
+    };
+    summary.clear();
+    error.clear();
+    Expect(!CreatePtsBackupArchive(archive.wstring(), true, false, options, progress,
+                                   summary, error, commitRaceCancelled,
+                                   [] { return false; }, cancelImmediatelyBeforeCommit),
+           "backup committed after cancellation won the point-of-no-return race");
+    std::ifstream racePreservedBackup(archive, std::ios::binary);
+    std::string racePreservedBytes((std::istreambuf_iterator<char>(racePreservedBackup)),
+                                   std::istreambuf_iterator<char>());
+    Expect(racePreservedBytes == "previous-valid-backup",
+           "commit-race cancellation replaced the previous archive");
+    racePreservedBackup.close();
     fs::remove_all(root, ignored);
 }
 
@@ -1115,6 +1153,7 @@ int main() {
         TestPtsBackgroundTaskKeepsUiThreadResponsive();
         TestPtsBackgroundTaskCanBeCancelled();
         TestPtsDialogLoopPreservesQuitAndDestroysWindow();
+        TestPtsCancellationCommitGateHasSingleWinner();
         TestAtomicCommitPreservesDestinationAcrossReplaceFailures();
         TestCrossVersionMappingAndCs6Aliases();
         TestFontCollisionPath();
