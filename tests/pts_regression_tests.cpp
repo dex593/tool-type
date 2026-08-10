@@ -537,6 +537,71 @@ void TestCrossVersionArchiveRestore() {
     fs::remove_all(root, ignored);
 }
 
+void TestSameVersionWorkspaceRestoreKeepsDistinctVariants() {
+    namespace fs = std::filesystem;
+    fs::path root = fs::temp_directory_path() / L"tooltype-pts-same-version-workspaces";
+    std::error_code ignored;
+    fs::remove_all(root, ignored);
+    fs::create_directories(root / L"Roaming");
+    fs::create_directories(root / L"Local");
+    ScopedEnvironmentVariable appData(L"APPDATA", (root / L"Roaming").wstring());
+    ScopedEnvironmentVariable localAppData(L"LOCALAPPDATA", (root / L"Local").wstring());
+
+    const std::string primaryXml =
+        "<photoshop-workspace version=\"1.0\"><frame name=\"primary\"/>"
+        "</photoshop-workspace>";
+    const std::string modifiedXml =
+        "<photoshop-workspace version=\"1.0\"><frame name=\"modified\"/>"
+        "</photoshop-workspace>";
+    const std::wstring settingsRoot =
+        L"Adobe\\Adobe Photoshop CS6\\Adobe Photoshop CS6 Settings\\";
+    TestArchiveEntry primary{
+        PtsEntryKind::PhotoshopSetting, L"APPDATA",
+        settingsRoot + L"WorkSpaces\\Untitled-1", L"Adobe Photoshop CS6",
+        std::vector<uint8_t>(primaryXml.begin(), primaryXml.end())};
+    TestArchiveEntry modified{
+        PtsEntryKind::PhotoshopSetting, L"APPDATA",
+        settingsRoot + L"WorkSpaces (Modified)\\Untitled-1", L"Adobe Photoshop CS6",
+        std::vector<uint8_t>(modifiedXml.begin(), modifiedXml.end())};
+    fs::path archive = root / L"same-version.afang";
+    WriteTestArchive(archive.wstring(), {primary, modified});
+
+    PtsRestoreOptions options{};
+    options.sourceVersionLabel = L"Adobe Photoshop CS6";
+    options.targetVersionLabel = L"Adobe Photoshop CS6";
+    options.targetAppDataRelativeRoot = L"Adobe\\Adobe Photoshop CS6";
+    options.targetLocalAppDataRelativeRoot = L"Adobe\\Adobe Photoshop CS6";
+    options.archiveHasSettings = true;
+    std::wstring summary;
+    std::wstring error;
+    auto progress = [](int, const std::wstring&) {};
+    auto registryUpdater = [](const std::wstring&, const std::set<std::wstring>&) {
+        return 1u;
+    };
+    Expect(RestorePtsBackupArchive(archive.wstring(), options, progress, summary, error,
+                                   PtsCancellationCallback{}, registryUpdater),
+           "same-version workspace restore failed");
+
+    fs::path restoredSettings = root / L"Roaming" / L"Adobe" /
+                                L"Adobe Photoshop CS6" /
+                                L"Adobe Photoshop CS6 Settings";
+    std::ifstream primaryFile(restoredSettings / L"WorkSpaces" / L"Untitled-1",
+                              std::ios::binary);
+    std::string primaryBytes((std::istreambuf_iterator<char>(primaryFile)),
+                             std::istreambuf_iterator<char>());
+    std::ifstream modifiedFile(
+        restoredSettings / L"WorkSpaces (Modified)" / L"Untitled-1", std::ios::binary);
+    std::string modifiedBytes((std::istreambuf_iterator<char>(modifiedFile)),
+                              std::istreambuf_iterator<char>());
+    Expect(primaryBytes == primaryXml,
+           "same-version restore overwrote WorkSpaces with its Modified alias");
+    Expect(modifiedBytes == modifiedXml,
+           "same-version restore overwrote WorkSpaces (Modified) with its primary alias");
+    primaryFile.close();
+    modifiedFile.close();
+    fs::remove_all(root, ignored);
+}
+
 void TestSettingsBackupArchive() {
     namespace fs = std::filesystem;
     fs::path root = fs::temp_directory_path() / L"tooltype-pts-settings-backup";
@@ -962,6 +1027,7 @@ int main() {
         TestCancelledBackupDeletesIncompleteArchive();
         TestCancelledRestoreStopsBeforeNextFile();
         TestCrossVersionArchiveRestore();
+        TestSameVersionWorkspaceRestoreKeepsDistinctVariants();
         TestIdenticalFontRestoreIsSkipped();
         TestMalformedArchiveDoesNotWriteAnything();
         TestAtomicRestoreWritePreservesLockedDestination();
