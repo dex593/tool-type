@@ -9,15 +9,20 @@
 #include <windows.h>
 #include <commdlg.h>
 #include <shellapi.h>
+#include <tlhelp32.h>
 #include <wininet.h>
 #include <zlib.h>
 
 #include <algorithm>
+#include <functional>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
+#include <cwctype>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -59,9 +64,9 @@ constexpr const wchar_t* kToolVersion = L"1.0";
 constexpr const wchar_t* kUpdateCheckUrl =
     L"https://github.com/dex593/tool-type/raw/refs/heads/master/check.ini";
 constexpr const wchar_t* kLatestVersionMessage =
-    L"Bạn đang sử dụng phiên bản mới nhất.";
+    L"Bạn đang sử dụng version mới nhất.";
 constexpr const wchar_t* kUpdateAvailableMessage =
-    L"Đã có phiên bản mới, click để tải ngay.";
+    L"Đã có version mới, click để tải ngay.";
 
 constexpr int ID_LIST = 1001;
 constexpr int ID_ADD = 1101;
@@ -74,7 +79,12 @@ constexpr int ID_GDOCS = 1107;
 constexpr int ID_HOTKEY = 1108;
 constexpr int ID_GUIDE = 1109;
 constexpr int ID_DEFAULT_HOTKEY = 1110;
+constexpr int ID_PTS = 1111;
 constexpr int ID_STATUS = 1201;
+constexpr int ID_PTS_BACKUP_SETTINGS = 1301;
+constexpr int ID_PTS_BACKUP_FONTS = 1302;
+constexpr int ID_PTS_BACKUP_ALL = 1303;
+constexpr int ID_PTS_RESTORE = 1304;
 constexpr int IDI_TOOLTYPE = 101;
 
 struct UpdateCheckResult {
@@ -680,6 +690,3200 @@ void WriteUtf8File(const std::wstring& path, const std::string& data) {
     CloseHandle(file);
 }
 
+enum class PtsEntryKind : uint8_t {
+    PhotoshopSetting = 1,
+    Font = 2,
+};
+
+struct PtsBackupItem {
+    PtsEntryKind kind = PtsEntryKind::PhotoshopSetting;
+    std::wstring sourcePath;
+    std::wstring rootToken;
+    std::wstring relativePath;
+    std::wstring displayName;
+    uint64_t size = 0;
+};
+
+struct PtsPhotoshopRoot {
+    std::wstring rootToken;
+    std::wstring baseRoot;
+    std::wstring scanRoot;
+    std::wstring relativeRoot;
+    std::wstring versionLabel;
+    std::wstring versionKey;
+};
+
+struct PtsPhotoshopVersion {
+    std::wstring label;
+    std::vector<PtsPhotoshopRoot> roots;
+};
+
+struct PtsBackupOptions {
+    std::set<std::wstring> selectedPhotoshopVersionKeys;
+    std::set<std::wstring> selectedPhotoshopVersionLabels;
+    std::wstring selectedPhotoshopVersionLabel;
+};
+
+struct PtsArchiveVersion {
+    std::wstring label;
+    std::set<std::wstring> rootKeys;
+};
+
+struct PtsArchiveScanResult {
+    std::vector<PtsArchiveVersion> versions;
+    bool hasSettings = false;
+    bool hasFonts = false;
+    uint32_t entryCount = 0;
+};
+
+struct PtsRestoreOptions {
+    std::set<std::wstring> sourceVersionKeys;
+    std::wstring sourceVersionLabel;
+    std::wstring targetVersionLabel;
+    std::wstring targetAppDataRelativeRoot;
+    std::wstring targetLocalAppDataRelativeRoot;
+    bool archiveHasSettings = false;
+    bool archiveValidated = false;
+
+    bool HasSourceFilter() const { return !sourceVersionKeys.empty(); }
+    bool HasTargetMapping() const { return !targetVersionLabel.empty(); }
+};
+
+using PtsProgressCallback = std::function<void(int, const std::wstring&)>;
+
+constexpr char kAfangMagic[8] = {'A', 'F', 'A', 'N', 'G', 'P', 'S', '1'};
+constexpr uint32_t kAfangVersion = 1;
+constexpr uint64_t kPtsMaxSingleFileBytes = 512ull * 1024ull * 1024ull;
+
+std::wstring LowerWide(std::wstring text) {
+    std::transform(text.begin(), text.end(), text.begin(), [](wchar_t ch) {
+        return static_cast<wchar_t>(towlower(ch));
+    });
+    return text;
+}
+
+std::wstring TrimTrailingSlashes(std::wstring path) {
+    while (path.size() > 3 && (path.back() == L'\\' || path.back() == L'/')) {
+        path.pop_back();
+    }
+    return path;
+}
+
+std::wstring GetEnvPath(const wchar_t* name) {
+    DWORD needed = GetEnvironmentVariableW(name, nullptr, 0);
+    if (needed == 0) return L"";
+    std::wstring value(static_cast<size_t>(needed), L'\0');
+    DWORD written = GetEnvironmentVariableW(name, value.data(), needed);
+    if (written == 0) return L"";
+    value.resize(static_cast<size_t>(written));
+    return TrimTrailingSlashes(value);
+}
+
+std::wstring JoinPath(const std::wstring& left, const std::wstring& right) {
+    if (left.empty()) return right;
+    if (right.empty()) return left;
+    if (right.size() > 1 && right[1] == L':') return right;
+    if (right.front() == L'\\' || right.front() == L'/') return right;
+    wchar_t sep = (left.back() == L'\\' || left.back() == L'/') ? L'\0' : L'\\';
+    return sep ? left + sep + right : left + right;
+}
+
+std::wstring ParentPath(const std::wstring& path) {
+    size_t pos = path.find_last_of(L"\\/");
+    if (pos == std::wstring::npos) return L"";
+    if (pos == 2 && path.size() >= 3 && path[1] == L':') return path.substr(0, 3);
+    if (pos == 0) return path.substr(0, 1);
+    return path.substr(0, pos);
+}
+
+bool DirectoryExists(const std::wstring& path) {
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+bool FileExists(const std::wstring& path) {
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+bool IsProcessRunningByBaseName(const std::wstring& processName) {
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return false;
+
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    std::wstring expected = LowerWide(processName);
+    bool found = false;
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            if (LowerWide(entry.szExeFile) == expected) {
+                found = true;
+                break;
+            }
+        } while (Process32NextW(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+    return found;
+}
+
+bool IsPhotoshopRunning() {
+    return IsProcessRunningByBaseName(L"Photoshop.exe");
+}
+
+bool EnsureDirectoryExists(const std::wstring& path) {
+    if (path.empty()) return false;
+    if (DirectoryExists(path)) return true;
+    std::wstring parent = ParentPath(path);
+    if (!parent.empty() && parent != path && !DirectoryExists(parent)) {
+        if (!EnsureDirectoryExists(parent)) return false;
+    }
+    if (CreateDirectoryW(path.c_str(), nullptr)) return true;
+    return GetLastError() == ERROR_ALREADY_EXISTS && DirectoryExists(path);
+}
+
+bool EnsureParentDirectory(const std::wstring& path) {
+    std::wstring parent = ParentPath(path);
+    return parent.empty() || EnsureDirectoryExists(parent);
+}
+
+bool GetFileSize64(const std::wstring& path, uint64_t& sizeOut) {
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) return false;
+    LARGE_INTEGER size{};
+    size.HighPart = static_cast<LONG>(data.nFileSizeHigh);
+    size.LowPart = data.nFileSizeLow;
+    if (size.QuadPart < 0) return false;
+    sizeOut = static_cast<uint64_t>(size.QuadPart);
+    return true;
+}
+
+std::wstring RelativePathFromRoot(const std::wstring& root, const std::wstring& path) {
+    std::wstring cleanRoot = TrimTrailingSlashes(root);
+    if (cleanRoot.empty()) return FileNameOnly(path);
+    std::wstring lowerRoot = LowerWide(cleanRoot);
+    std::wstring lowerPath = LowerWide(path);
+    if (lowerPath == lowerRoot) return L"";
+    if (lowerPath.rfind(lowerRoot, 0) == 0 &&
+        path.size() > cleanRoot.size() &&
+        (path[cleanRoot.size()] == L'\\' || path[cleanRoot.size()] == L'/')) {
+        return path.substr(cleanRoot.size() + 1);
+    }
+    return FileNameOnly(path);
+}
+
+bool IsValidWindowsBaseFileName(const std::wstring& path);
+
+bool IsSafeRelativePath(const std::wstring& path) {
+    if (path.empty()) return false;
+    if (path.find(L':') != std::wstring::npos) return false;
+    if (path.front() == L'\\' || path.front() == L'/') return false;
+    size_t start = 0;
+    while (start <= path.size()) {
+        size_t end = path.find_first_of(L"\\/", start);
+        std::wstring part = path.substr(start, end == std::wstring::npos ? std::wstring::npos : end - start);
+        if (part == L"." || part == L".." || part.empty() ||
+            !IsValidWindowsBaseFileName(part)) {
+            return false;
+        }
+        if (end == std::wstring::npos) break;
+        start = end + 1;
+    }
+    return true;
+}
+
+bool IsBaseFileNameOnly(const std::wstring& path) {
+    return !path.empty() &&
+           path.find_first_of(L"\\/") == std::wstring::npos &&
+           path.find(L':') == std::wstring::npos &&
+           path != L"." &&
+           path != L"..";
+}
+
+bool IsValidWindowsBaseFileName(const std::wstring& path) {
+    if (!IsBaseFileNameOnly(path)) return false;
+    if (path.back() == L'.' || path.back() == L' ') return false;
+    if (path.find_first_of(L"<>\"|?*") != std::wstring::npos) return false;
+    for (wchar_t ch : path) {
+        if (ch < 0x20) return false;
+    }
+
+    std::wstring stem = path;
+    size_t dot = stem.find(L'.');
+    if (dot != std::wstring::npos) stem.resize(dot);
+    while (!stem.empty() && (stem.back() == L'.' || stem.back() == L' ')) {
+        stem.pop_back();
+    }
+    stem = LowerWide(stem);
+    const wchar_t* reserved[] = {
+        L"con", L"prn", L"aux", L"nul",
+        L"com1", L"com2", L"com3", L"com4", L"com5", L"com6", L"com7", L"com8", L"com9",
+        L"lpt1", L"lpt2", L"lpt3", L"lpt4", L"lpt5", L"lpt6", L"lpt7", L"lpt8", L"lpt9"
+    };
+    for (const wchar_t* name : reserved) {
+        if (stem == name) return false;
+    }
+    return true;
+}
+
+std::wstring NormalizeRelativePathSlashes(std::wstring path) {
+    std::replace(path.begin(), path.end(), L'/', L'\\');
+    return path;
+}
+
+std::vector<std::wstring> SplitRelativePathParts(const std::wstring& path) {
+    std::vector<std::wstring> parts;
+    size_t start = 0;
+    while (start <= path.size()) {
+        size_t end = path.find_first_of(L"\\/", start);
+        std::wstring part = path.substr(start, end == std::wstring::npos ? std::wstring::npos : end - start);
+        if (!part.empty()) parts.push_back(part);
+        if (end == std::wstring::npos) break;
+        start = end + 1;
+    }
+    return parts;
+}
+
+std::wstring JoinRelativePathParts(const std::vector<std::wstring>& parts, size_t count) {
+    std::wstring out;
+    count = std::min(count, parts.size());
+    for (size_t i = 0; i < count; ++i) {
+        if (!out.empty()) out += L"\\";
+        out += parts[i];
+    }
+    return out;
+}
+
+std::wstring NormalizePhotoshopVersionLabel(std::wstring label) {
+    label = TrimCopy(label);
+    std::wstring lower = LowerWide(label);
+    const std::wstring settingsSuffix = L" settings";
+    if (lower.size() > settingsSuffix.size() &&
+        lower.rfind(settingsSuffix) == lower.size() - settingsSuffix.size()) {
+        label.resize(label.size() - settingsSuffix.size());
+        label = TrimCopy(label);
+        lower = LowerWide(label);
+    }
+    const wchar_t* suffixes[] = {L" (64 bit)", L" (32 bit)"};
+    for (const wchar_t* suffix : suffixes) {
+        std::wstring suffixText = suffix;
+        if (lower.size() > suffixText.size() &&
+            lower.rfind(suffixText) == lower.size() - suffixText.size()) {
+            label.resize(label.size() - suffixText.size());
+            label = TrimCopy(label);
+            break;
+        }
+    }
+    return label;
+}
+
+bool LooksLikePhotoshopVersionLabel(const std::wstring& label) {
+    std::wstring normalized = NormalizePhotoshopVersionLabel(label);
+    std::wstring lower = LowerWide(normalized);
+    if (normalized.empty() || lower.find(L"photoshop") == std::wstring::npos) return false;
+    if (lower.find(L"camera raw") != std::wstring::npos) return false;
+    if (lower.find(L"plugin") != std::wstring::npos) return false;
+    if (lower.find(L"_gude") != std::wstring::npos) return false;
+    return IsBaseFileNameOnly(normalized);
+}
+
+bool ExtractPhotoshopVersionInfo(const std::wstring& path, std::wstring& relativeRoot,
+                                  std::wstring& label) {
+    if (!IsSafeRelativePath(path)) return false;
+    std::wstring lower = LowerWide(path);
+    if (lower.rfind(L"adobe\\", 0) != 0 && lower.rfind(L"adobe/", 0) != 0) {
+        return false;
+    }
+
+    std::vector<std::wstring> parts = SplitRelativePathParts(path);
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (LowerWide(parts[i]).find(L"photoshop") != std::wstring::npos) {
+            relativeRoot = JoinRelativePathParts(parts, i + 1);
+            label = NormalizePhotoshopVersionLabel(parts[i]);
+            return IsSafeRelativePath(relativeRoot) && !label.empty();
+        }
+    }
+    return false;
+}
+
+bool IsAllowedPhotoshopSettingsRelativePath(const std::wstring& path) {
+    std::wstring relativeRoot;
+    std::wstring label;
+    return ExtractPhotoshopVersionInfo(path, relativeRoot, label);
+}
+
+std::wstring PtsPhotoshopVersionKey(const std::wstring& rootToken,
+                                    const std::wstring& relativeRoot) {
+    return LowerWide(rootToken + L"\\" + NormalizeRelativePathSlashes(relativeRoot));
+}
+
+bool HasFontExtension(const std::wstring& path) {
+    std::wstring ext = ExtensionLower(path);
+    return ext == L".ttf" || ext == L".otf" || ext == L".ttc" ||
+           ext == L".otc" || ext == L".fon";
+}
+
+bool HasLikelyCacheDirectoryName(const std::wstring& name) {
+    std::wstring lower = LowerWide(name);
+    return lower == L"cache" || lower == L"caches" || lower == L"temp" ||
+           lower == L"tmp" || lower == L"logs" || lower == L"log" ||
+           lower.find(L"autorecover") != std::wstring::npos ||
+           lower.find(L"media cache") != std::wstring::npos;
+}
+
+void CollectFilesRecursive(const std::wstring& directory, std::vector<std::wstring>& files,
+                           bool skipLikelyCaches,
+                           const PtsProgressCallback& progress = {},
+                           int progressPercent = 0,
+                           const std::wstring& progressLabel = L"",
+                           size_t* visited = nullptr) {
+    std::wstring pattern = JoinPath(directory, L"*");
+    WIN32_FIND_DATAW data{};
+    HANDLE find = FindFirstFileW(pattern.c_str(), &data);
+    if (find == INVALID_HANDLE_VALUE) return;
+
+    do {
+        std::wstring name = data.cFileName;
+        if (name == L"." || name == L"..") continue;
+        if (visited) {
+            ++(*visited);
+            if (progress && (*visited == 1 || *visited % 64 == 0)) {
+                progress(progressPercent, progressLabel + L" (" +
+                                             std::to_wstring(*visited) + L" mục)...");
+            }
+        }
+        std::wstring full = JoinPath(directory, name);
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (skipLikelyCaches && HasLikelyCacheDirectoryName(name)) continue;
+            CollectFilesRecursive(full, files, skipLikelyCaches, progress,
+                                  progressPercent, progressLabel, visited);
+        } else {
+            files.push_back(full);
+        }
+    } while (FindNextFileW(find, &data));
+
+    FindClose(find);
+}
+
+void FindPhotoshopDirectoriesRecursive(const std::wstring& directory, int depth,
+                                       std::vector<std::wstring>& roots) {
+    if (depth < 0) return;
+    std::wstring pattern = JoinPath(directory, L"*");
+    WIN32_FIND_DATAW data{};
+    HANDLE find = FindFirstFileW(pattern.c_str(), &data);
+    if (find == INVALID_HANDLE_VALUE) return;
+
+    do {
+        std::wstring name = data.cFileName;
+        if (name == L"." || name == L"..") continue;
+        if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+        std::wstring full = JoinPath(directory, name);
+        std::wstring lower = LowerWide(name);
+        if (lower.find(L"photoshop") != std::wstring::npos) {
+            roots.push_back(full);
+            continue;
+        }
+        FindPhotoshopDirectoriesRecursive(full, depth - 1, roots);
+    } while (FindNextFileW(find, &data));
+
+    FindClose(find);
+}
+
+void FindImmediatePhotoshopDirectories(const std::wstring& directory,
+                                       std::vector<std::wstring>& roots) {
+    std::wstring pattern = JoinPath(directory, L"*");
+    WIN32_FIND_DATAW data{};
+    HANDLE find = FindFirstFileW(pattern.c_str(), &data);
+    if (find == INVALID_HANDLE_VALUE) return;
+
+    do {
+        std::wstring name = data.cFileName;
+        if (name == L"." || name == L"..") continue;
+        if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+        if (!LooksLikePhotoshopVersionLabel(name)) continue;
+        roots.push_back(JoinPath(directory, name));
+    } while (FindNextFileW(find, &data));
+
+    FindClose(find);
+}
+
+void AddPhotoshopVersionRoot(const std::wstring& baseRoot, const std::wstring& rootToken,
+                             const std::wstring& scanRoot,
+                             std::vector<PtsPhotoshopRoot>& roots,
+                             std::set<std::wstring>& seen) {
+    std::wstring relativeRootCandidate = RelativePathFromRoot(baseRoot, scanRoot);
+    std::wstring relativeRoot;
+    std::wstring label;
+    if (!ExtractPhotoshopVersionInfo(relativeRootCandidate, relativeRoot, label)) return;
+
+    std::wstring key = PtsPhotoshopVersionKey(rootToken, relativeRoot);
+    if (!seen.insert(key).second) return;
+
+    PtsPhotoshopRoot root{};
+    root.rootToken = rootToken;
+    root.baseRoot = baseRoot;
+    root.scanRoot = scanRoot;
+    root.relativeRoot = NormalizeRelativePathSlashes(relativeRoot);
+    root.versionLabel = label;
+    root.versionKey = key;
+    roots.push_back(std::move(root));
+}
+
+std::vector<PtsPhotoshopRoot> DiscoverPhotoshopRoots() {
+    std::vector<PtsPhotoshopRoot> roots;
+    std::set<std::wstring> seen;
+    struct RootSpec {
+        const wchar_t* envName;
+        const wchar_t* token;
+    };
+    RootSpec specs[] = {{L"APPDATA", L"APPDATA"}, {L"LOCALAPPDATA", L"LOCALAPPDATA"}};
+    for (const auto& spec : specs) {
+        std::wstring base = GetEnvPath(spec.envName);
+        if (base.empty()) continue;
+        std::wstring adobe = JoinPath(base, L"Adobe");
+        if (!DirectoryExists(adobe)) continue;
+        std::vector<std::wstring> photoshopRoots;
+        FindImmediatePhotoshopDirectories(adobe, photoshopRoots);
+        if (photoshopRoots.empty()) {
+            FindPhotoshopDirectoriesRecursive(adobe, 1, photoshopRoots);
+        }
+        for (const auto& root : photoshopRoots) {
+            AddPhotoshopVersionRoot(base, spec.token, root, roots, seen);
+        }
+    }
+    return roots;
+}
+
+std::vector<PtsPhotoshopVersion> GroupPhotoshopVersions(
+    const std::vector<PtsPhotoshopRoot>& roots) {
+    std::vector<PtsPhotoshopVersion> versions;
+    for (const auto& root : roots) {
+        std::wstring groupKey = LowerWide(root.versionLabel);
+        auto it = std::find_if(versions.begin(), versions.end(), [&](const PtsPhotoshopVersion& v) {
+            return LowerWide(v.label) == groupKey;
+        });
+        if (it == versions.end()) {
+            PtsPhotoshopVersion version{};
+            version.label = root.versionLabel;
+            version.roots.push_back(root);
+            versions.push_back(std::move(version));
+        } else {
+            it->roots.push_back(root);
+        }
+    }
+    return versions;
+}
+
+void AddInstalledPhotoshopLabel(const std::wstring& rawLabel, std::vector<std::wstring>& labels,
+                                std::set<std::wstring>& seen) {
+    std::wstring label = NormalizePhotoshopVersionLabel(rawLabel);
+    if (!LooksLikePhotoshopVersionLabel(label)) return;
+    std::wstring key = LowerWide(label);
+    if (seen.insert(key).second) labels.push_back(label);
+}
+
+void AddInstalledPhotoshopLabelsFromDirectory(const std::wstring& adobeDirectory,
+                                              std::vector<std::wstring>& labels,
+                                              std::set<std::wstring>& seen) {
+    if (!DirectoryExists(adobeDirectory)) return;
+    std::wstring pattern = JoinPath(adobeDirectory, L"*");
+    WIN32_FIND_DATAW data{};
+    HANDLE find = FindFirstFileW(pattern.c_str(), &data);
+    if (find == INVALID_HANDLE_VALUE) return;
+    do {
+        std::wstring name = data.cFileName;
+        if (name == L"." || name == L"..") continue;
+        if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+        std::wstring installRoot = JoinPath(adobeDirectory, name);
+        if (!FileExists(JoinPath(installRoot, L"Photoshop.exe"))) continue;
+        AddInstalledPhotoshopLabel(name, labels, seen);
+    } while (FindNextFileW(find, &data));
+    FindClose(find);
+}
+
+bool ReadRegistryStringValue(HKEY key, const wchar_t* valueName, std::wstring& value) {
+    DWORD type = 0;
+    DWORD bytes = 0;
+    LONG rc = RegQueryValueExW(key, valueName, nullptr, &type, nullptr, &bytes);
+    if (rc != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ) || bytes == 0) {
+        return false;
+    }
+    std::vector<wchar_t> buffer(bytes / sizeof(wchar_t) + 2, L'\0');
+    rc = RegQueryValueExW(key, valueName, nullptr, &type,
+                          reinterpret_cast<LPBYTE>(buffer.data()), &bytes);
+    if (rc != ERROR_SUCCESS) return false;
+    value.assign(buffer.data());
+    value = TrimCopy(value);
+    return !value.empty();
+}
+
+std::wstring ExpandEnvironmentPath(std::wstring path) {
+    path = TrimCopy(path);
+    if (path.empty()) return L"";
+
+    DWORD needed = ExpandEnvironmentStringsW(path.c_str(), nullptr, 0);
+    if (needed <= 1) return path;
+    std::wstring expanded(static_cast<size_t>(needed), L'\0');
+    DWORD written = ExpandEnvironmentStringsW(path.c_str(), expanded.data(), needed);
+    if (written == 0 || written >= needed) return path;
+    expanded.resize(static_cast<size_t>(written - 1));
+    return TrimCopy(expanded);
+}
+
+size_t FindCaseInsensitive(const std::wstring& text, const std::wstring& needle) {
+    if (needle.empty()) return 0;
+    return LowerWide(text).find(LowerWide(needle));
+}
+
+std::wstring ExecutablePathFromRegistryHint(std::wstring hint) {
+    hint = TrimCopy(hint);
+    if (!hint.empty() && hint.front() == L'@') {
+        hint.erase(hint.begin());
+        hint = TrimCopy(hint);
+    }
+    if (hint.empty()) return L"";
+
+    std::wstring candidate;
+    if (hint.front() == L'"') {
+        size_t endQuote = hint.find(L'"', 1);
+        if (endQuote != std::wstring::npos) {
+            candidate = hint.substr(1, endQuote - 1);
+        }
+    }
+    if (candidate.empty()) {
+        size_t exePos = FindCaseInsensitive(hint, L".exe");
+        if (exePos != std::wstring::npos) {
+            candidate = hint.substr(0, exePos + 4);
+        } else {
+            candidate = hint;
+            size_t comma = candidate.find(L',');
+            if (comma != std::wstring::npos) candidate.resize(comma);
+        }
+    }
+    return ExpandEnvironmentPath(candidate);
+}
+
+bool RegistryValuePointsToExistingPhotoshopExe(HKEY key, const wchar_t* valueName) {
+    std::wstring raw;
+    if (!ReadRegistryStringValue(key, valueName, raw)) return false;
+
+    std::wstring path = ExecutablePathFromRegistryHint(raw);
+    if (path.empty()) return false;
+    if (DirectoryExists(path)) path = JoinPath(path, L"Photoshop.exe");
+    if (!FileExists(path)) return false;
+
+    std::wstring file = LowerWide(FileNameOnly(path));
+    return file == L"photoshop.exe";
+}
+
+bool RegistryEntryHasExistingPhotoshopExecutable(HKEY appKey) {
+    const wchar_t* pathValues[] = {
+        L"InstallLocation",
+        L"InstallPath",
+        L"DisplayIcon",
+        L"UninstallString",
+        L"QuietUninstallString",
+    };
+    for (const wchar_t* valueName : pathValues) {
+        if (RegistryValuePointsToExistingPhotoshopExe(appKey, valueName)) return true;
+    }
+    return false;
+}
+
+void AddInstalledPhotoshopLabelsFromUninstall(HKEY hive, REGSAM viewFlags,
+                                               std::vector<std::wstring>& labels,
+                                               std::set<std::wstring>& seen) {
+    HKEY uninstall = nullptr;
+    REGSAM access = KEY_READ | viewFlags;
+    if (RegOpenKeyExW(hive, L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+                      0, access, &uninstall) != ERROR_SUCCESS) {
+        return;
+    }
+
+    for (DWORD index = 0;; ++index) {
+        wchar_t subKeyName[512] = {};
+        DWORD subKeyLen = static_cast<DWORD>(std::size(subKeyName));
+        LONG rc = RegEnumKeyExW(uninstall, index, subKeyName, &subKeyLen,
+                                nullptr, nullptr, nullptr, nullptr);
+        if (rc == ERROR_NO_MORE_ITEMS) break;
+        if (rc != ERROR_SUCCESS) continue;
+
+        HKEY appKey = nullptr;
+        if (RegOpenKeyExW(uninstall, subKeyName, 0, access, &appKey) != ERROR_SUCCESS) {
+            continue;
+        }
+        std::wstring displayName;
+        if (ReadRegistryStringValue(appKey, L"DisplayName", displayName) &&
+            RegistryEntryHasExistingPhotoshopExecutable(appKey)) {
+            AddInstalledPhotoshopLabel(displayName, labels, seen);
+        }
+        RegCloseKey(appKey);
+    }
+
+    RegCloseKey(uninstall);
+}
+
+std::vector<std::wstring> DiscoverInstalledPhotoshopVersionLabels() {
+    std::vector<std::wstring> labels;
+    std::set<std::wstring> seen;
+
+    const wchar_t* envNames[] = {L"ProgramFiles", L"ProgramFiles(x86)", L"ProgramW6432"};
+    for (const wchar_t* envName : envNames) {
+        std::wstring base = GetEnvPath(envName);
+        if (!base.empty()) AddInstalledPhotoshopLabelsFromDirectory(JoinPath(base, L"Adobe"), labels, seen);
+    }
+
+    AddInstalledPhotoshopLabelsFromUninstall(HKEY_CURRENT_USER, 0, labels, seen);
+    AddInstalledPhotoshopLabelsFromUninstall(HKEY_LOCAL_MACHINE, 0, labels, seen);
+    AddInstalledPhotoshopLabelsFromUninstall(HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY, labels, seen);
+    AddInstalledPhotoshopLabelsFromUninstall(HKEY_LOCAL_MACHINE, KEY_WOW64_32KEY, labels, seen);
+
+    std::sort(labels.begin(), labels.end(), [](const std::wstring& a, const std::wstring& b) {
+        return LowerWide(a) < LowerWide(b);
+    });
+    return labels;
+}
+
+void MergeInstalledPhotoshopLabels(std::vector<PtsPhotoshopVersion>& versions,
+                                   const std::vector<std::wstring>& labels) {
+    for (const auto& label : labels) {
+        std::wstring key = LowerWide(label);
+        auto it = std::find_if(versions.begin(), versions.end(), [&](const PtsPhotoshopVersion& v) {
+            return LowerWide(v.label) == key;
+        });
+        if (it == versions.end()) {
+            PtsPhotoshopVersion version{};
+            version.label = label;
+            versions.push_back(std::move(version));
+        }
+    }
+}
+
+bool IsInstalledPhotoshopLabel(const std::wstring& label,
+                               const std::vector<std::wstring>& installedLabels) {
+    if (installedLabels.empty()) return true;
+    std::wstring normalized = LowerWide(NormalizePhotoshopVersionLabel(label));
+    return std::any_of(installedLabels.begin(), installedLabels.end(),
+                       [&](const std::wstring& installed) {
+                           return LowerWide(NormalizePhotoshopVersionLabel(installed)) ==
+                                  normalized;
+                       });
+}
+
+std::vector<PtsPhotoshopRoot> FilterPhotoshopRootsByInstalledLabels(
+    const std::vector<PtsPhotoshopRoot>& roots,
+    const std::vector<std::wstring>& installedLabels) {
+    if (installedLabels.empty()) return {};
+
+    std::vector<PtsPhotoshopRoot> filtered;
+    for (const auto& root : roots) {
+        if (IsInstalledPhotoshopLabel(root.versionLabel, installedLabels)) {
+            filtered.push_back(root);
+        }
+    }
+    return filtered;
+}
+
+std::vector<PtsPhotoshopRoot> DiscoverInstalledPhotoshopRoots() {
+    return FilterPhotoshopRootsByInstalledLabels(DiscoverPhotoshopRoots(),
+                                                 DiscoverInstalledPhotoshopVersionLabels());
+}
+
+std::vector<PtsPhotoshopVersion> DiscoverPhotoshopVersions() {
+    std::vector<std::wstring> installedLabels = DiscoverInstalledPhotoshopVersionLabels();
+    std::vector<PtsPhotoshopVersion> versions =
+        GroupPhotoshopVersions(FilterPhotoshopRootsByInstalledLabels(DiscoverPhotoshopRoots(),
+                                                                     installedLabels));
+    MergeInstalledPhotoshopLabels(versions, installedLabels);
+    std::sort(versions.begin(), versions.end(), [](const PtsPhotoshopVersion& a,
+                                                   const PtsPhotoshopVersion& b) {
+        return LowerWide(a.label) < LowerWide(b.label);
+    });
+    return versions;
+}
+
+std::wstring RootForToken(const PtsPhotoshopVersion& version, const std::wstring& token) {
+    for (const auto& root : version.roots) {
+        if (root.rootToken == token) return root.relativeRoot;
+    }
+    return L"";
+}
+
+std::wstring DefaultPhotoshopRelativeRootForLabel(const std::wstring& label) {
+    return IsValidWindowsBaseFileName(label) ? JoinPath(L"Adobe", label) : L"";
+}
+
+void AddPhotoshopItemsFromRoot(const PtsPhotoshopRoot& root,
+                               std::vector<PtsBackupItem>& items,
+                               std::set<std::wstring>& seen,
+                               const PtsProgressCallback& progress,
+                               size_t& visited) {
+    std::vector<std::wstring> files;
+    CollectFilesRecursive(root.scanRoot, files, true, progress, 8,
+                          L"Đang quét settings Photoshop", &visited);
+    size_t processed = 0;
+    for (const auto& file : files) {
+        ++processed;
+        if (progress && (processed == 1 || processed % 64 == 0)) {
+            progress(8, L"Đang kiểm tra settings của " + root.versionLabel + L" (" +
+                             std::to_wstring(processed) + L" file)...");
+        }
+        uint64_t size = 0;
+        if (!GetFileSize64(file, size) || size > kPtsMaxSingleFileBytes) continue;
+        std::wstring rel = RelativePathFromRoot(root.baseRoot, file);
+        if (!IsAllowedPhotoshopSettingsRelativePath(rel)) continue;
+        std::wstring key = LowerWide(root.rootToken + L"\\" + rel);
+        if (!seen.insert(key).second) continue;
+        PtsBackupItem item{};
+        item.kind = PtsEntryKind::PhotoshopSetting;
+        item.sourcePath = file;
+        item.rootToken = root.rootToken;
+        item.relativePath = NormalizeRelativePathSlashes(rel);
+        item.displayName = root.versionLabel.empty() ? L"Photoshop settings" : root.versionLabel;
+        item.size = size;
+        items.push_back(std::move(item));
+    }
+}
+
+void GatherPhotoshopSettingItems(std::vector<PtsBackupItem>& items,
+                                 const PtsBackupOptions& options,
+                                 const PtsProgressCallback& progress = {}) {
+    std::set<std::wstring> seen;
+    bool hasVersionFilter = !options.selectedPhotoshopVersionKeys.empty() ||
+                            !options.selectedPhotoshopVersionLabels.empty();
+    if (progress) progress(5, L"Đang dò thư mục settings Photoshop...");
+    std::vector<PtsPhotoshopRoot> roots = DiscoverInstalledPhotoshopRoots();
+    size_t visited = 0;
+    for (const auto& root : roots) {
+        if (hasVersionFilter &&
+            options.selectedPhotoshopVersionKeys.count(root.versionKey) == 0 &&
+            options.selectedPhotoshopVersionLabels.count(LowerWide(root.versionLabel)) == 0) {
+            continue;
+        }
+        if (progress) {
+            progress(8, L"Đang quét " + root.versionLabel + L"...");
+        }
+        AddPhotoshopItemsFromRoot(root, items, seen, progress, visited);
+    }
+    if (progress) {
+        progress(12, L"Đã tìm thấy " + std::to_wstring(items.size()) +
+                         L" file settings phù hợp.");
+    }
+}
+
+bool IsDefaultWindowsFont(const std::wstring& fileName, const std::wstring& displayName) {
+    std::wstring file = LowerWide(fileName);
+    std::wstring name = LowerWide(displayName);
+    const wchar_t* defaultPrefixes[] = {
+        L"arial", L"bahnschrift", L"calibri", L"cambria", L"candara",
+        L"comic", L"consola", L"constan", L"corbel", L"cour", L"ebrima",
+        L"framd", L"gadugi", L"georgia", L"holomdl2", L"impact", L"javatext",
+        L"leelawad", L"lucon", L"malgun", L"marlett", L"micross", L"mingliu",
+        L"mmrtext", L"msgothic", L"msjh", L"msyi", L"mvboli", L"nirmala",
+        L"ntailu", L"palab", L"phagspa", L"seg", L"simsun", L"sitka",
+        L"sylfaen", L"symbol", L"tahoma", L"times", L"trebuc", L"verdana",
+        L"webdings", L"wingding", L"yugoth", L"cascadia", L"inkfree",
+        L"segoe", L"msmincho", L"meiryo", L"batang", L"gulim"
+    };
+    for (const wchar_t* prefix : defaultPrefixes) {
+        if (file.rfind(prefix, 0) == 0) return true;
+    }
+    const wchar_t* defaultNames[] = {
+        L"arial", L"bahnschrift", L"calibri", L"cambria", L"candara",
+        L"comic sans", L"consolas", L"constantia", L"corbel", L"courier",
+        L"ebrima", L"gadugi", L"georgia", L"impact", L"leelawadee",
+        L"lucida", L"malgun", L"microsoft", L"nirmala", L"palatino",
+        L"segoe", L"sim", L"sitka", L"sylfaen", L"symbol", L"tahoma",
+        L"times new roman", L"trebuchet", L"verdana", L"webdings",
+        L"wingdings", L"yu gothic", L"cascadia"
+    };
+    for (const wchar_t* text : defaultNames) {
+        if (name.find(text) != std::wstring::npos) return true;
+    }
+    return false;
+}
+
+std::wstring ResolveFontRegistryPath(const std::wstring& rawPath, bool userScope) {
+    if (rawPath.empty()) return L"";
+    wchar_t expanded[MAX_PATH * 4] = {};
+    DWORD expandedLen = ExpandEnvironmentStringsW(rawPath.c_str(), expanded,
+                                                  static_cast<DWORD>(std::size(expanded)));
+    std::wstring path = (expandedLen > 0 && expandedLen < std::size(expanded))
+                            ? std::wstring(expanded)
+                            : rawPath;
+    if (path.size() > 1 && path[1] == L':') return path;
+    if (!path.empty() && (path.front() == L'\\' || path.front() == L'/')) return path;
+
+    std::wstring base = userScope
+                            ? JoinPath(GetEnvPath(L"LOCALAPPDATA"), L"Microsoft\\Windows\\Fonts")
+                            : JoinPath(GetEnvPath(L"WINDIR"), L"Fonts");
+    return JoinPath(base, path);
+}
+
+void AddFontItem(const std::wstring& path, const std::wstring& displayName,
+                 bool alwaysCustom, std::vector<PtsBackupItem>& items,
+                 std::set<std::wstring>& seen) {
+    if (!FileExists(path) || !HasFontExtension(path)) return;
+    std::wstring fileName = FileNameOnly(path);
+    if (!alwaysCustom && IsDefaultWindowsFont(fileName, displayName)) return;
+    uint64_t size = 0;
+    if (!GetFileSize64(path, size) || size > kPtsMaxSingleFileBytes) return;
+    std::wstring key = LowerWide(path);
+    if (!seen.insert(key).second) return;
+    PtsBackupItem item{};
+    item.kind = PtsEntryKind::Font;
+    item.sourcePath = path;
+    item.rootToken = L"FONT";
+    item.relativePath = fileName;
+    item.displayName = displayName.empty() ? fileName : displayName;
+    item.size = size;
+    items.push_back(std::move(item));
+}
+
+void GatherFontsFromRegistry(HKEY hive, bool userScope, std::vector<PtsBackupItem>& items,
+                             std::set<std::wstring>& seen,
+                             const PtsProgressCallback& progress,
+                             int progressPercent,
+                             size_t& visited) {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(hive, L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Fonts",
+                      0, KEY_READ, &key) != ERROR_SUCCESS) {
+        return;
+    }
+
+    for (DWORD index = 0;; ++index) {
+        wchar_t valueName[512] = {};
+        DWORD valueNameLen = static_cast<DWORD>(std::size(valueName));
+        wchar_t data[2048] = {};
+        DWORD dataSize = sizeof(data);
+        DWORD type = 0;
+        LONG rc = RegEnumValueW(key, index, valueName, &valueNameLen, nullptr,
+                                &type, reinterpret_cast<LPBYTE>(data), &dataSize);
+        if (rc == ERROR_NO_MORE_ITEMS) break;
+        if (rc != ERROR_SUCCESS) continue;
+        ++visited;
+        if (progress && (visited == 1 || visited % 64 == 0)) {
+            progress(progressPercent, L"Đang kiểm tra danh sách font (" +
+                                          std::to_wstring(visited) + L" mục)...");
+        }
+        if (type != REG_SZ && type != REG_EXPAND_SZ) continue;
+        std::wstring raw(data, data + (dataSize / sizeof(wchar_t)));
+        if (!raw.empty() && raw.back() == L'\0') raw.pop_back();
+        std::wstring path = ResolveFontRegistryPath(raw, userScope);
+        AddFontItem(path, std::wstring(valueName, valueNameLen), userScope, items, seen);
+    }
+
+    RegCloseKey(key);
+}
+
+void GatherFontItems(std::vector<PtsBackupItem>& items,
+                     const PtsProgressCallback& progress = {}) {
+    std::set<std::wstring> seen;
+    size_t registryValues = 0;
+    if (progress) progress(14, L"Đang đọc font của người dùng hiện tại...");
+    GatherFontsFromRegistry(HKEY_CURRENT_USER, true, items, seen, progress, 15,
+                            registryValues);
+    if (progress) progress(16, L"Đang đọc font đã cài trên máy...");
+    GatherFontsFromRegistry(HKEY_LOCAL_MACHINE, false, items, seen, progress, 17,
+                            registryValues);
+
+    std::wstring userFonts = JoinPath(GetEnvPath(L"LOCALAPPDATA"), L"Microsoft\\Windows\\Fonts");
+    if (DirectoryExists(userFonts)) {
+        std::vector<std::wstring> files;
+        size_t visited = 0;
+        CollectFilesRecursive(userFonts, files, false, progress, 18,
+                              L"Đang quét thư mục font người dùng", &visited);
+        size_t processed = 0;
+        for (const auto& file : files) {
+            ++processed;
+            if (progress && (processed == 1 || processed % 64 == 0)) {
+                progress(19, L"Đang kiểm tra font người dùng (" +
+                                 std::to_wstring(processed) + L" file)...");
+            }
+            AddFontItem(file, FileNameOnly(file), true, items, seen);
+        }
+    }
+}
+
+bool WriteAll(HANDLE file, const void* data, DWORD bytes) {
+    const uint8_t* ptr = static_cast<const uint8_t*>(data);
+    DWORD remaining = bytes;
+    while (remaining > 0) {
+        DWORD written = 0;
+        if (!WriteFile(file, ptr, remaining, &written, nullptr) || written == 0) return false;
+        ptr += written;
+        remaining -= written;
+    }
+    return true;
+}
+
+bool ReadAll(HANDLE file, void* data, DWORD bytes) {
+    uint8_t* ptr = static_cast<uint8_t*>(data);
+    DWORD remaining = bytes;
+    while (remaining > 0) {
+        DWORD read = 0;
+        if (!ReadFile(file, ptr, remaining, &read, nullptr) || read == 0) return false;
+        ptr += read;
+        remaining -= read;
+    }
+    return true;
+}
+
+bool WriteU8(HANDLE file, uint8_t value) {
+    return WriteAll(file, &value, 1);
+}
+
+bool ReadU8(HANDLE file, uint8_t& value) {
+    return ReadAll(file, &value, 1);
+}
+
+bool WriteU32File(HANDLE file, uint32_t value) {
+    uint8_t bytes[4] = {
+        static_cast<uint8_t>(value & 0xff),
+        static_cast<uint8_t>((value >> 8) & 0xff),
+        static_cast<uint8_t>((value >> 16) & 0xff),
+        static_cast<uint8_t>((value >> 24) & 0xff),
+    };
+    return WriteAll(file, bytes, 4);
+}
+
+bool ReadU32File(HANDLE file, uint32_t& value) {
+    uint8_t bytes[4] = {};
+    if (!ReadAll(file, bytes, 4)) return false;
+    value = static_cast<uint32_t>(bytes[0]) |
+            (static_cast<uint32_t>(bytes[1]) << 8) |
+            (static_cast<uint32_t>(bytes[2]) << 16) |
+            (static_cast<uint32_t>(bytes[3]) << 24);
+    return true;
+}
+
+bool WriteU64File(HANDLE file, uint64_t value) {
+    uint8_t bytes[8] = {};
+    for (int i = 0; i < 8; ++i) bytes[i] = static_cast<uint8_t>((value >> (i * 8)) & 0xff);
+    return WriteAll(file, bytes, 8);
+}
+
+bool ReadU64File(HANDLE file, uint64_t& value) {
+    uint8_t bytes[8] = {};
+    if (!ReadAll(file, bytes, 8)) return false;
+    value = 0;
+    for (int i = 0; i < 8; ++i) value |= static_cast<uint64_t>(bytes[i]) << (i * 8);
+    return true;
+}
+
+bool WriteUtf8String(HANDLE file, const std::wstring& value) {
+    std::string utf8 = WideToUtf8(value);
+    if (utf8.size() > 1024u * 1024u) return false;
+    return WriteU32File(file, static_cast<uint32_t>(utf8.size())) &&
+           (utf8.empty() || WriteAll(file, utf8.data(), static_cast<DWORD>(utf8.size())));
+}
+
+bool ReadUtf8String(HANDLE file, std::wstring& value) {
+    uint32_t size = 0;
+    if (!ReadU32File(file, size) || size > 1024u * 1024u) return false;
+    std::string utf8(size, '\0');
+    if (size > 0 && !ReadAll(file, utf8.data(), size)) return false;
+    value = Utf8ToWide(utf8, false);
+    return true;
+}
+
+bool WriteBytesToFile(const std::wstring& path, const std::vector<uint8_t>& bytes,
+                      std::wstring& error) {
+    if (!EnsureParentDirectory(path)) {
+        error = L"Không tạo được thư mục đích.";
+        return false;
+    }
+
+    static volatile LONG tempSequence = 0;
+    std::wstring tempPath;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < 32; ++attempt) {
+        LONG sequence = InterlockedIncrement(&tempSequence);
+        tempPath = path + L".tooltype-tmp-" + std::to_wstring(GetCurrentProcessId()) +
+                   L"-" + std::to_wstring(sequence);
+        file = CreateFileW(tempPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                           FILE_ATTRIBUTE_TEMPORARY, nullptr);
+        if (file != INVALID_HANDLE_VALUE) break;
+        if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) {
+            break;
+        }
+    }
+    if (file == INVALID_HANDLE_VALUE) {
+        DWORD rc = GetLastError();
+        error = L"Không tạo được file tạm để restore.\nMã lỗi: " +
+                std::to_wstring(rc) + L".";
+        return false;
+    }
+
+    bool ok = (bytes.empty() ||
+               WriteAll(file, bytes.data(), static_cast<DWORD>(bytes.size()))) &&
+              FlushFileBuffers(file);
+    CloseHandle(file);
+    if (!ok) {
+        DWORD rc = GetLastError();
+        DeleteFileW(tempPath.c_str());
+        error = L"Lỗi ghi file tạm khi restore.\nMã lỗi: " +
+                std::to_wstring(rc) + L".";
+        return false;
+    }
+
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    bool destinationExists = attrs != INVALID_FILE_ATTRIBUTES;
+    bool clearedReadOnly = destinationExists && !(attrs & FILE_ATTRIBUTE_DIRECTORY) &&
+                           (attrs & FILE_ATTRIBUTE_READONLY);
+    if (clearedReadOnly) SetFileAttributesW(path.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
+
+    bool replaced = false;
+    if (destinationExists && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        replaced = ReplaceFileW(path.c_str(), tempPath.c_str(), nullptr,
+                                REPLACEFILE_IGNORE_MERGE_ERRORS, nullptr, nullptr) != FALSE;
+    }
+    if (!replaced) {
+        replaced = MoveFileExW(tempPath.c_str(), path.c_str(),
+                               MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+    }
+    if (!replaced) {
+        DWORD rc = GetLastError();
+        DeleteFileW(tempPath.c_str());
+        if (clearedReadOnly) SetFileAttributesW(path.c_str(), attrs);
+        error = L"Không thay được file đích khi restore.\nMã lỗi: " +
+                std::to_wstring(rc) + L".";
+        return false;
+    }
+    return true;
+}
+
+void CompressForArchive(const std::vector<uint8_t>& input, uint8_t& method,
+                        std::vector<uint8_t>& output) {
+    method = 0;
+    output = input;
+    if (input.empty()) return;
+    uLongf bound = compressBound(static_cast<uLong>(input.size()));
+    std::vector<uint8_t> compressed(static_cast<size_t>(bound));
+    int rc = compress2(compressed.data(), &bound, input.data(), static_cast<uLong>(input.size()),
+                       Z_BEST_COMPRESSION);
+    if (rc == Z_OK && bound < input.size()) {
+        compressed.resize(static_cast<size_t>(bound));
+        output.swap(compressed);
+        method = 1;
+    }
+}
+
+bool DecompressFromArchive(const std::vector<uint8_t>& input, uint8_t method,
+                           uint64_t originalSize, std::vector<uint8_t>& output) {
+    if (originalSize > kPtsMaxSingleFileBytes) return false;
+    if (method == 0) {
+        if (input.size() != originalSize) return false;
+        output = input;
+        return true;
+    }
+    if (method != 1) return false;
+    output.assign(static_cast<size_t>(originalSize), 0);
+    uLongf outSize = static_cast<uLongf>(output.size());
+    int rc = uncompress(output.data(), &outSize, input.data(), static_cast<uLong>(input.size()));
+    if (rc != Z_OK || outSize != originalSize) return false;
+    return true;
+}
+
+std::wstring TruncatePtsNoticeLine(const std::wstring& line, size_t maxChars) {
+    if (line.size() <= maxChars) return line;
+    if (maxChars <= 3) return line.substr(0, maxChars);
+    return TrimCopy(line.substr(0, maxChars - 3)) + L"...";
+}
+
+std::wstring CollapsePtsWhitespace(const std::wstring& text) {
+    std::wstring out;
+    out.reserve(text.size());
+    bool pendingSpace = false;
+    for (wchar_t ch : text) {
+        if (iswspace(ch)) {
+            pendingSpace = !out.empty();
+            continue;
+        }
+        if (pendingSpace) out.push_back(L' ');
+        pendingSpace = false;
+        out.push_back(ch);
+    }
+    return out;
+}
+
+void AddCompactPtsNoticeLine(std::vector<std::wstring>& lines, const std::wstring& rawLine) {
+    constexpr size_t kPtsNoticeLineLimit = 40;
+    std::wstring remaining = CollapsePtsWhitespace(rawLine);
+    while (!remaining.empty() && lines.size() < 2) {
+        if (remaining.size() <= kPtsNoticeLineLimit) {
+            lines.push_back(remaining);
+            return;
+        }
+
+        size_t split = remaining.rfind(L' ', kPtsNoticeLineLimit);
+        if (split == std::wstring::npos || split < 16) {
+            lines.push_back(TruncatePtsNoticeLine(remaining, kPtsNoticeLineLimit));
+            return;
+        }
+
+        lines.push_back(TrimCopy(remaining.substr(0, split)));
+        remaining = TrimCopy(remaining.substr(split + 1));
+    }
+}
+
+std::wstring CompactPtsNotice(const std::wstring& text) {
+    std::vector<std::wstring> lines;
+    for (const auto& rawLine : SplitLines(text)) {
+        AddCompactPtsNoticeLine(lines, rawLine);
+        if (lines.size() >= 2) break;
+    }
+    if (lines.empty()) return L"...";
+    if (lines.size() == 1) return lines.front();
+    return lines[0] + L"\n" + lines[1];
+}
+
+std::wstring FormatBytes(uint64_t bytes) {
+    wchar_t text[64] = {};
+    if (bytes >= 1024ull * 1024ull * 1024ull) {
+        swprintf(text, 64, L"%.1f GB", static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0));
+    } else if (bytes >= 1024ull * 1024ull) {
+        swprintf(text, 64, L"%.1f MB", static_cast<double>(bytes) / (1024.0 * 1024.0));
+    } else if (bytes >= 1024ull) {
+        swprintf(text, 64, L"%.1f KB", static_cast<double>(bytes) / 1024.0);
+    } else {
+        swprintf(text, 64, L"%llu B", static_cast<unsigned long long>(bytes));
+    }
+    return text;
+}
+
+bool CreatePtsBackupArchive(const std::wstring& path, bool includeSettings, bool includeFonts,
+                            const PtsBackupOptions& options,
+                            const PtsProgressCallback& progress, std::wstring& summary,
+                            std::wstring& error) {
+    std::vector<PtsBackupItem> items;
+    if (includeSettings) {
+        progress(5, options.selectedPhotoshopVersionLabel.empty()
+                        ? L"Đang tìm settings Photoshop trong AppData..."
+                        : L"Đang tìm settings của " + options.selectedPhotoshopVersionLabel + L"...");
+        GatherPhotoshopSettingItems(items, options, progress);
+    }
+    size_t settingsCount = items.size();
+    if (includeFonts) {
+        progress(includeSettings ? 14 : 8, L"Đang tìm font custom...");
+        GatherFontItems(items, progress);
+    }
+    size_t fontCount = items.size() - settingsCount;
+    if (items.empty()) {
+        error = L"Không tìm thấy settings Photoshop hoặc font custom để backup.";
+        return false;
+    }
+
+    progress(20, L"Đang tạo file .afang...");
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE | GENERIC_READ, 0, nullptr,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        error = L"Không tạo được file backup .afang.";
+        return false;
+    }
+
+    bool ok = WriteAll(file, kAfangMagic, sizeof(kAfangMagic)) &&
+              WriteU32File(file, kAfangVersion) &&
+              WriteU32File(file, 0);
+    uint32_t writtenEntries = 0;
+    uint32_t skipped = 0;
+    uint64_t sourceBytes = 0;
+    uint64_t archiveBytes = 0;
+
+    for (size_t i = 0; ok && i < items.size(); ++i) {
+        const auto& item = items[i];
+        int percent = 20 + static_cast<int>((i * 72) / std::max<size_t>(1, items.size()));
+        progress(percent, L"Đang nén " + FileNameOnly(item.sourcePath) +
+                          L" (" + std::to_wstring(i + 1) + L"/" +
+                          std::to_wstring(items.size()) + L")...");
+
+        std::vector<uint8_t> raw;
+        std::wstring readError;
+        if (!ReadFileBytes(item.sourcePath, raw, readError)) {
+            ++skipped;
+            continue;
+        }
+        uint8_t method = 0;
+        std::vector<uint8_t> stored;
+        CompressForArchive(raw, method, stored);
+        sourceBytes += static_cast<uint64_t>(raw.size());
+        archiveBytes += static_cast<uint64_t>(stored.size());
+
+        ok = WriteU8(file, static_cast<uint8_t>(item.kind)) &&
+             WriteUtf8String(file, item.rootToken) &&
+             WriteUtf8String(file, item.relativePath) &&
+             WriteUtf8String(file, item.displayName) &&
+             WriteU64File(file, static_cast<uint64_t>(raw.size())) &&
+             WriteU64File(file, static_cast<uint64_t>(stored.size())) &&
+             WriteU8(file, method) &&
+             (stored.empty() || WriteAll(file, stored.data(), static_cast<DWORD>(stored.size())));
+        if (ok) {
+            ++writtenEntries;
+        }
+    }
+
+    if (ok) {
+        LARGE_INTEGER pos{};
+        pos.QuadPart = sizeof(kAfangMagic) + sizeof(uint32_t);
+        ok = SetFilePointerEx(file, pos, nullptr, FILE_BEGIN) &&
+             WriteU32File(file, writtenEntries);
+    }
+    CloseHandle(file);
+
+    if (!ok || writtenEntries == 0) {
+        DeleteFileW(path.c_str());
+        error = L"Lỗi khi ghi file backup .afang.";
+        return false;
+    }
+
+    progress(100, L"Hoàn tất backup .afang.");
+    summary = L"Đã backup " + std::to_wstring(writtenEntries) + L" file (" +
+              FormatBytes(sourceBytes) + L" → " + FormatBytes(archiveBytes) + L").";
+    if (settingsCount > 0 || fontCount > 0) {
+        summary += L" Settings: " + std::to_wstring(settingsCount) +
+                   L", font custom: " + std::to_wstring(fontCount) + L".";
+    }
+    if (includeSettings && !options.selectedPhotoshopVersionLabel.empty()) {
+        summary += L" Phiên bản Photoshop: " + options.selectedPhotoshopVersionLabel + L".";
+    }
+    if (skipped > 0) {
+        summary += L" Bỏ qua " + std::to_wstring(skipped) + L" file không đọc được.";
+    }
+    return true;
+}
+
+std::wstring FontRegistryNameFromFile(const std::wstring& path) {
+    std::wstring file = FileNameOnly(path);
+    std::wstring ext = ExtensionLower(file);
+    std::wstring stem = file;
+    size_t dot = stem.find_last_of(L'.');
+    if (dot != std::wstring::npos) stem.resize(dot);
+    if (ext == L".otf") return stem + L" (OpenType)";
+    return stem + L" (TrueType)";
+}
+
+struct RestoredUserFont {
+    std::wstring path;
+    std::wstring displayName;
+};
+
+struct FontRegistrationResult {
+    uint32_t resourceRegistrations = 0;
+    uint32_t registryUpdates = 0;
+};
+
+std::wstring SafeFontRegistryValueName(const RestoredUserFont& font) {
+    std::wstring name = font.displayName.empty()
+                            ? FontRegistryNameFromFile(font.path)
+                            : font.displayName;
+    name.erase(std::remove_if(name.begin(), name.end(), [](wchar_t ch) {
+                   return ch == L'\r' || ch == L'\n' || ch == L'\t' || ch < 32;
+               }),
+               name.end());
+    if (name.size() > 200) name.resize(200);
+    if (name.empty()) name = FontRegistryNameFromFile(font.path);
+    return name;
+}
+
+std::wstring NonConflictingFontRegistryValueName(HKEY key, const RestoredUserFont& font) {
+    std::wstring base = SafeFontRegistryValueName(font);
+    for (int i = 0; i <= 999; ++i) {
+        std::wstring candidate = i == 0
+                                     ? base
+                                     : base + L" (ToolType restored " +
+                                           std::to_wstring(i) + L")";
+        DWORD type = 0;
+        DWORD bytes = 0;
+        LONG rc = RegQueryValueExW(key, candidate.c_str(), nullptr, &type, nullptr, &bytes);
+        if (rc == ERROR_FILE_NOT_FOUND) return candidate;
+        if (rc != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ) ||
+            bytes < sizeof(wchar_t)) {
+            continue;
+        }
+        std::wstring existing(bytes / sizeof(wchar_t), L'\0');
+        if (RegQueryValueExW(key, candidate.c_str(), nullptr, &type,
+                             reinterpret_cast<BYTE*>(existing.data()), &bytes) != ERROR_SUCCESS) {
+            continue;
+        }
+        while (!existing.empty() && existing.back() == L'\0') existing.pop_back();
+        if (LowerWide(existing) == LowerWide(font.path)) return candidate;
+    }
+    return L"";
+}
+
+FontRegistrationResult RegisterRestoredUserFonts(
+    const std::vector<RestoredUserFont>& fonts,
+    const PtsProgressCallback& progress = {}) {
+    FontRegistrationResult result{};
+    HKEY key = nullptr;
+    RegCreateKeyExW(HKEY_CURRENT_USER,
+                    L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Fonts",
+                    0, nullptr, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, nullptr, &key, nullptr);
+
+    for (size_t index = 0; index < fonts.size(); ++index) {
+        const auto& font = fonts[index];
+        if (AddFontResourceExW(font.path.c_str(), 0, nullptr) > 0) {
+            ++result.resourceRegistrations;
+        }
+        if (key) {
+            std::wstring valueName = NonConflictingFontRegistryValueName(key, font);
+            if (!valueName.empty() &&
+                RegSetValueExW(key, valueName.c_str(), 0, REG_SZ,
+                               reinterpret_cast<const BYTE*>(font.path.c_str()),
+                               static_cast<DWORD>((font.path.size() + 1) * sizeof(wchar_t))) ==
+                    ERROR_SUCCESS) {
+                ++result.registryUpdates;
+            }
+        }
+        if (progress && (index == 0 || (index + 1) % 8 == 0 || index + 1 == fonts.size())) {
+            int percent = 95 + static_cast<int>(((index + 1) * 2) / fonts.size());
+            progress(percent, L"Đang đăng ký font " + std::to_wstring(index + 1) + L"/" +
+                                  std::to_wstring(fonts.size()) + L"...");
+        }
+    }
+
+    if (key) RegCloseKey(key);
+    return result;
+}
+
+bool FileMatchesBytes(const std::wstring& path, const std::vector<uint8_t>& bytes) {
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              nullptr, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file, &size) || size.QuadPart < 0 ||
+        static_cast<uint64_t>(size.QuadPart) != bytes.size()) {
+        CloseHandle(file);
+        return false;
+    }
+
+    uint8_t buffer[64 * 1024] = {};
+    size_t offset = 0;
+    bool equal = true;
+    while (offset < bytes.size()) {
+        DWORD chunk = static_cast<DWORD>(
+            std::min<size_t>(bytes.size() - offset, sizeof(buffer)));
+        DWORD read = 0;
+        if (!ReadFile(file, buffer, chunk, &read, nullptr) || read != chunk ||
+            std::memcmp(buffer, bytes.data() + offset, chunk) != 0) {
+            equal = false;
+            break;
+        }
+        offset += read;
+    }
+    CloseHandle(file);
+    return equal;
+}
+
+std::wstring ReusableOrNonConflictingFontPath(const std::wstring& desiredPath,
+                                              const std::vector<uint8_t>& bytes,
+                                              bool& identicalFileExists) {
+    identicalFileExists = false;
+    if (!FileExists(desiredPath)) return desiredPath;
+    if (FileMatchesBytes(desiredPath, bytes)) {
+        identicalFileExists = true;
+        return desiredPath;
+    }
+
+    const std::wstring directory = ParentPath(desiredPath);
+    const std::wstring name = FileNameOnly(desiredPath);
+    std::wstring stem = name;
+    std::wstring extension;
+    size_t dot = name.find_last_of(L'.');
+    if (dot != std::wstring::npos) {
+        stem = name.substr(0, dot);
+        extension = name.substr(dot);
+    }
+
+    for (int i = 1; i <= 999; ++i) {
+        std::wstring candidate = JoinPath(
+            directory, stem + L"-restored-" + std::to_wstring(i) + extension);
+        if (!FileExists(candidate)) return candidate;
+        if (FileMatchesBytes(candidate, bytes)) {
+            identicalFileExists = true;
+            return candidate;
+        }
+    }
+    return L"";
+}
+
+bool ReadPtsArchiveHeader(HANDLE file, uint32_t& count, std::wstring& error) {
+    char magic[8] = {};
+    uint32_t version = 0;
+    count = 0;
+    bool ok = ReadAll(file, magic, sizeof(magic)) &&
+              std::memcmp(magic, kAfangMagic, sizeof(kAfangMagic)) == 0 &&
+              ReadU32File(file, version) &&
+              ReadU32File(file, count) &&
+              version == kAfangVersion &&
+              count < 200000;
+    if (!ok) {
+        error = L"File .afang không đúng định dạng hoặc không hỗ trợ version này.";
+    }
+    return ok;
+}
+
+bool ValidatePtsArchiveEntryMetadata(uint8_t kindByte, const std::wstring& rootToken,
+                                     const std::wstring& relativePath,
+                                     uint64_t originalSize, uint64_t storedSize,
+                                     uint8_t method, std::wstring& error) {
+    if (kindByte != static_cast<uint8_t>(PtsEntryKind::PhotoshopSetting) &&
+        kindByte != static_cast<uint8_t>(PtsEntryKind::Font)) {
+        error = L"File .afang chứa loại dữ liệu không được hỗ trợ.";
+        return false;
+    }
+    if (originalSize > kPtsMaxSingleFileBytes || storedSize > kPtsMaxSingleFileBytes ||
+        (method != 0 && method != 1)) {
+        error = L"File .afang bị lỗi ở phần metadata.";
+        return false;
+    }
+    if (kindByte == static_cast<uint8_t>(PtsEntryKind::Font)) {
+        if (rootToken != L"FONT" || !IsValidWindowsBaseFileName(relativePath) ||
+            !HasFontExtension(relativePath)) {
+            error = L"File .afang chứa font có tên file không hợp lệ.";
+            return false;
+        }
+        return true;
+    }
+
+    if ((rootToken != L"APPDATA" && rootToken != L"LOCALAPPDATA") ||
+        !IsAllowedPhotoshopSettingsRelativePath(relativePath)) {
+        error = L"File .afang chứa đường dẫn Photoshop settings không hợp lệ.";
+        return false;
+    }
+    return true;
+}
+
+bool ReadPtsArchiveEntryMetadata(HANDLE file, uint8_t& kindByte, std::wstring& rootToken,
+                                 std::wstring& relativePath, std::wstring& displayName,
+                                 uint64_t& originalSize, uint64_t& storedSize,
+                                 uint8_t& method, std::wstring& error) {
+    if (!ReadU8(file, kindByte) ||
+        !ReadUtf8String(file, rootToken) ||
+        !ReadUtf8String(file, relativePath) ||
+        !ReadUtf8String(file, displayName) ||
+        !ReadU64File(file, originalSize) ||
+        !ReadU64File(file, storedSize) ||
+        !ReadU8(file, method)) {
+        error = L"File .afang bị lỗi ở phần metadata.";
+        return false;
+    }
+    relativePath = NormalizeRelativePathSlashes(relativePath);
+    return ValidatePtsArchiveEntryMetadata(kindByte, rootToken, relativePath,
+                                           originalSize, storedSize, method, error);
+}
+
+bool SkipFileBytes(HANDLE file, uint64_t bytes) {
+    LARGE_INTEGER zero{};
+    LARGE_INTEGER current{};
+    LARGE_INTEGER fileSize{};
+    if (!SetFilePointerEx(file, zero, &current, FILE_CURRENT) ||
+        !GetFileSizeEx(file, &fileSize) || current.QuadPart < 0 ||
+        fileSize.QuadPart < current.QuadPart) {
+        return false;
+    }
+    uint64_t remaining = static_cast<uint64_t>(fileSize.QuadPart - current.QuadPart);
+    if (bytes > remaining || bytes > static_cast<uint64_t>(INT64_MAX)) return false;
+    LARGE_INTEGER move{};
+    move.QuadPart = static_cast<LONGLONG>(bytes);
+    return SetFilePointerEx(file, move, nullptr, FILE_CURRENT) != FALSE;
+}
+
+void AddArchiveVersion(PtsArchiveScanResult& scan, const std::wstring& label,
+                       const std::wstring& versionKey) {
+    std::wstring groupKey = LowerWide(label);
+    auto it = std::find_if(scan.versions.begin(), scan.versions.end(), [&](const PtsArchiveVersion& v) {
+        return LowerWide(v.label) == groupKey;
+    });
+    if (it == scan.versions.end()) {
+        PtsArchiveVersion version{};
+        version.label = label;
+        version.rootKeys.insert(versionKey);
+        scan.versions.push_back(std::move(version));
+    } else {
+        it->rootKeys.insert(versionKey);
+    }
+}
+
+bool InspectPtsArchiveVersions(const std::wstring& path, PtsArchiveScanResult& scan,
+                               std::wstring& error,
+                               const PtsProgressCallback& progress = {}) {
+    scan = PtsArchiveScanResult{};
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                              nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        error = L"Không mở được file .afang.";
+        return false;
+    }
+
+    uint32_t count = 0;
+    if (!ReadPtsArchiveHeader(file, count, error)) {
+        CloseHandle(file);
+        return false;
+    }
+    scan.entryCount = count;
+    if (progress) progress(1, L"Đang đọc metadata file .afang...");
+
+    for (uint32_t i = 0; i < count; ++i) {
+        uint8_t kindByte = 0;
+        std::wstring rootToken;
+        std::wstring relativePath;
+        std::wstring displayName;
+        uint64_t originalSize = 0;
+        uint64_t storedSize = 0;
+        uint8_t method = 0;
+        if (!ReadPtsArchiveEntryMetadata(file, kindByte, rootToken, relativePath, displayName,
+                                         originalSize, storedSize, method, error)) {
+            CloseHandle(file);
+            return false;
+        }
+
+        if (kindByte == static_cast<uint8_t>(PtsEntryKind::PhotoshopSetting)) {
+            scan.hasSettings = true;
+            std::wstring relativeRoot;
+            std::wstring label;
+            if (!ExtractPhotoshopVersionInfo(relativePath, relativeRoot, label)) {
+                CloseHandle(file);
+                error = L"File .afang chứa Photoshop settings không xác định được version.";
+                return false;
+            }
+            AddArchiveVersion(scan, label, PtsPhotoshopVersionKey(rootToken, relativeRoot));
+        } else if (kindByte == static_cast<uint8_t>(PtsEntryKind::Font)) {
+            scan.hasFonts = true;
+        }
+
+        if (!SkipFileBytes(file, storedSize)) {
+            CloseHandle(file);
+            error = L"File .afang bị thiếu dữ liệu.";
+            return false;
+        }
+        if (progress && (i == 0 || (i + 1) % 50 == 0 || i + 1 == count)) {
+            int percent = count == 0
+                              ? 8
+                              : 1 + static_cast<int>((static_cast<uint64_t>(i + 1) * 7) / count);
+            progress(percent, L"Đang kiểm tra mục " + std::to_wstring(i + 1) + L"/" +
+                                  std::to_wstring(count) + L" trong .afang...");
+        }
+    }
+
+    if (count == 0 && progress) progress(8, L"Đã kiểm tra metadata file .afang.");
+
+    CloseHandle(file);
+    return true;
+}
+
+bool EndsWithCaseInsensitive(const std::wstring& text, const std::wstring& suffix) {
+    if (text.size() < suffix.size()) return false;
+    return LowerWide(text.substr(text.size() - suffix.size())) == LowerWide(suffix);
+}
+
+bool ShouldRewritePhotoshopVersionLabel(const std::wstring& sourceLabel,
+                                        const std::wstring& targetLabel) {
+    std::wstring source = NormalizePhotoshopVersionLabel(sourceLabel);
+    std::wstring target = NormalizePhotoshopVersionLabel(targetLabel);
+    if (source.empty() || target.empty() || LowerWide(source) == LowerWide(target)) {
+        return false;
+    }
+    if (LowerWide(source) == L"photoshop") {
+        return false;
+    }
+    return LooksLikePhotoshopVersionLabel(source) && LooksLikePhotoshopVersionLabel(target);
+}
+
+std::wstring PhotoshopSettingsFolderName(const std::wstring& label) {
+    std::wstring normalized = NormalizePhotoshopVersionLabel(label);
+    return normalized.empty() ? L"" : normalized + L" Settings";
+}
+
+bool IsPhotoshopSettingsFolderSegment(const std::wstring& segment) {
+    const std::wstring settingsSuffix = L" settings";
+    if (!EndsWithCaseInsensitive(segment, settingsSuffix)) return false;
+    return LooksLikePhotoshopVersionLabel(NormalizePhotoshopVersionLabel(segment));
+}
+
+bool IsPhotoshopSettingsFolderForLabel(const std::wstring& segment,
+                                       const std::wstring& label) {
+    if (!IsPhotoshopSettingsFolderSegment(segment)) return false;
+    std::wstring segmentLabel = NormalizePhotoshopVersionLabel(segment);
+    std::wstring normalizedLabel = NormalizePhotoshopVersionLabel(label);
+    return !normalizedLabel.empty() && LowerWide(segmentLabel) == LowerWide(normalizedLabel);
+}
+
+std::wstring ReplaceAllCaseInsensitive(std::wstring text, const std::wstring& oldText,
+                                       const std::wstring& newText) {
+    if (oldText.empty()) return text;
+    std::wstring lowerText = LowerWide(text);
+    std::wstring lowerOld = LowerWide(oldText);
+    size_t pos = 0;
+    while ((pos = lowerText.find(lowerOld, pos)) != std::wstring::npos) {
+        text.replace(pos, oldText.size(), newText);
+        lowerText.replace(pos, oldText.size(), LowerWide(newText));
+        pos += newText.size();
+    }
+    return text;
+}
+
+std::wstring RewritePhotoshopVersionLabelInSegment(const std::wstring& segment,
+                                                   const std::wstring& sourceLabel,
+                                                   const std::wstring& targetLabel) {
+    std::wstring source = NormalizePhotoshopVersionLabel(sourceLabel);
+    std::wstring target = NormalizePhotoshopVersionLabel(targetLabel);
+    if (source.empty() || target.empty()) return segment;
+    if (LowerWide(segment) == LowerWide(source)) return target;
+    if (IsPhotoshopSettingsFolderForLabel(segment, source)) {
+        return PhotoshopSettingsFolderName(target);
+    }
+    if (LowerWide(source) == L"photoshop" && IsPhotoshopSettingsFolderSegment(segment)) {
+        return PhotoshopSettingsFolderName(target);
+    }
+    if (!ShouldRewritePhotoshopVersionLabel(sourceLabel, targetLabel)) {
+        return segment;
+    }
+    return ReplaceAllCaseInsensitive(segment, source, target);
+}
+
+bool BuildMappedPhotoshopSettingsRelativePath(const std::wstring& sourcePath,
+                                               const std::wstring& sourceRoot,
+                                               const std::wstring& targetRoot,
+                                               const std::wstring& sourceLabel,
+                                               const std::wstring& targetLabel,
+                                              std::wstring& output) {
+    std::vector<std::wstring> sourceParts = SplitRelativePathParts(NormalizeRelativePathSlashes(sourceRoot));
+    std::vector<std::wstring> targetParts = SplitRelativePathParts(NormalizeRelativePathSlashes(targetRoot));
+    std::vector<std::wstring> pathParts = SplitRelativePathParts(NormalizeRelativePathSlashes(sourcePath));
+    if (sourceParts.empty() || targetParts.empty() || pathParts.size() < sourceParts.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < sourceParts.size(); ++i) {
+        if (LowerWide(pathParts[i]) != LowerWide(sourceParts[i])) return false;
+    }
+
+    std::vector<std::wstring> suffix(pathParts.begin() + sourceParts.size(), pathParts.end());
+    std::wstring source = NormalizePhotoshopVersionLabel(sourceLabel);
+    std::wstring targetSettingsFolder = PhotoshopSettingsFolderName(targetLabel);
+    if (!suffix.empty() &&
+        (IsPhotoshopSettingsFolderForLabel(suffix.front(), source) ||
+         (LowerWide(source) == L"photoshop" && IsPhotoshopSettingsFolderSegment(suffix.front())))) {
+        if (!targetSettingsFolder.empty() &&
+            !targetParts.empty() &&
+            IsPhotoshopSettingsFolderForLabel(targetParts.back(), targetLabel)) {
+            suffix.erase(suffix.begin());
+        } else if (!targetSettingsFolder.empty()) {
+            suffix.front() = targetSettingsFolder;
+        }
+    }
+
+    for (auto& part : suffix) {
+        part = RewritePhotoshopVersionLabelInSegment(part, sourceLabel, targetLabel);
+    }
+
+    std::vector<std::wstring> result = targetParts;
+    result.insert(result.end(), suffix.begin(), suffix.end());
+    output = JoinRelativePathParts(result, result.size());
+    return IsSafeRelativePath(output) && IsAllowedPhotoshopSettingsRelativePath(output);
+}
+
+void AddUniquePhotoshopRestoreRelativePath(std::vector<std::wstring>& paths,
+                                           const std::wstring& path) {
+    std::wstring normalized = NormalizeRelativePathSlashes(path);
+    if (!IsSafeRelativePath(normalized) || !IsAllowedPhotoshopSettingsRelativePath(normalized)) {
+        return;
+    }
+    std::wstring key = LowerWide(normalized);
+    for (const auto& existing : paths) {
+        if (LowerWide(existing) == key) return;
+    }
+    paths.push_back(std::move(normalized));
+}
+
+std::wstring PhotoshopLegacyCsSuffix(const std::wstring& label) {
+    std::wstring normalized = NormalizePhotoshopVersionLabel(label);
+    std::wstring lower = LowerWide(normalized);
+    size_t photoshop = lower.find(L"photoshop");
+    if (photoshop == std::wstring::npos) return L"";
+
+    std::wstring suffix = TrimCopy(normalized.substr(photoshop + 9));
+    std::wstring lowerSuffix = LowerWide(suffix);
+    if (lowerSuffix.rfind(L"cs", 0) != 0) return L"";
+
+    size_t firstSpace = suffix.find_first_of(L" \t");
+    std::wstring firstToken = firstSpace == std::wstring::npos
+                                  ? suffix
+                                  : suffix.substr(0, firstSpace);
+    return LowerWide(firstToken).rfind(L"cs", 0) == 0 ? firstToken : L"";
+}
+
+std::vector<std::wstring> PhotoshopFilenameLabelsForTarget(const std::wstring& targetLabel) {
+    std::vector<std::wstring> labels;
+    std::wstring normalized = NormalizePhotoshopVersionLabel(targetLabel);
+    if (!normalized.empty()) labels.push_back(normalized);
+
+    std::wstring csSuffix = PhotoshopLegacyCsSuffix(targetLabel);
+    if (!csSuffix.empty()) {
+        labels.push_back(L"Adobe Photoshop X64 " + csSuffix);
+    }
+    return labels;
+}
+
+bool UsesLegacyPhotoshopWorkspaceNames(const std::wstring& targetLabel) {
+    return !PhotoshopLegacyCsSuffix(targetLabel).empty();
+}
+
+bool IsPhotoshopPreferenceFileName(const std::wstring& fileName) {
+    std::wstring lower = LowerWide(fileName);
+    std::wstring ext = ExtensionLower(fileName);
+    if (ext != L".psp" && ext != L".psw" && ext != L".xml" && ext != L".kys" &&
+        ext != L".mnu") {
+        return false;
+    }
+    return lower.find(L"prefs") != std::wstring::npos ||
+           lower.find(L"preferences") != std::wstring::npos ||
+           lower.find(L"workspace") != std::wstring::npos ||
+           lower.find(L"toolbar") != std::wstring::npos ||
+           lower.find(L"tool") != std::wstring::npos ||
+           lower.find(L"photoshop") != std::wstring::npos;
+}
+
+void AddPhotoshopVersionFilenameAliases(std::vector<std::wstring>& paths,
+                                        const std::wstring& primaryPath,
+                                        const std::wstring& targetLabel) {
+    std::vector<std::wstring> parts = SplitRelativePathParts(primaryPath);
+    if (parts.empty() || !IsPhotoshopPreferenceFileName(parts.back())) return;
+
+    std::vector<std::wstring> labels = PhotoshopFilenameLabelsForTarget(targetLabel);
+    if (labels.size() <= 1) return;
+
+    std::wstring primaryLabel = labels.front();
+    if (primaryLabel.empty()) return;
+
+    for (size_t i = 1; i < labels.size(); ++i) {
+        std::wstring aliasName = ReplaceAllCaseInsensitive(parts.back(), primaryLabel, labels[i]);
+        if (aliasName == parts.back()) continue;
+        std::vector<std::wstring> aliasParts = parts;
+        aliasParts.back() = aliasName;
+        AddUniquePhotoshopRestoreRelativePath(paths,
+                                             JoinRelativePathParts(aliasParts, aliasParts.size()));
+    }
+}
+
+bool IsWorkspaceDirectoryName(const std::wstring& part) {
+    std::wstring lower = LowerWide(part);
+    return lower == L"workspaces" || lower == L"workspaces (modified)";
+}
+
+void AddLegacyWorkspaceNoExtensionAlias(std::vector<std::wstring>& paths,
+                                        const std::vector<std::wstring>& parts,
+                                        const std::wstring& targetLabel) {
+    if (!UsesLegacyPhotoshopWorkspaceNames(targetLabel) || parts.size() < 2) return;
+    if (ExtensionLower(parts.back()) != L".psw") return;
+
+    bool insideWorkspaceDirectory = false;
+    for (size_t i = 0; i + 1 < parts.size(); ++i) {
+        if (IsWorkspaceDirectoryName(parts[i])) {
+            insideWorkspaceDirectory = true;
+            break;
+        }
+    }
+    if (!insideWorkspaceDirectory) return;
+
+    std::vector<std::wstring> aliasParts = parts;
+    std::wstring fileName = aliasParts.back();
+    aliasParts.back() = fileName.substr(0, fileName.size() - 4);
+    AddUniquePhotoshopRestoreRelativePath(paths,
+                                          JoinRelativePathParts(aliasParts, aliasParts.size()));
+}
+
+void AddWorkspaceCompatibilityAliases(std::vector<std::wstring>& paths,
+                                      const std::wstring& primaryPath,
+                                      const std::wstring& targetLabel) {
+    std::vector<std::wstring> parts = SplitRelativePathParts(primaryPath);
+    if (parts.size() < 2) return;
+
+    bool touchedWorkspace = false;
+    std::vector<size_t> workspaceIndexes;
+    AddLegacyWorkspaceNoExtensionAlias(paths, parts, targetLabel);
+    for (size_t i = 0; i + 1 < parts.size(); ++i) {
+        std::wstring lower = LowerWide(parts[i]);
+        if (!IsWorkspaceDirectoryName(parts[i])) continue;
+        touchedWorkspace = true;
+        workspaceIndexes.push_back(i);
+
+        std::vector<std::wstring> aliasParts = parts;
+        aliasParts[i] = lower == L"workspaces (modified)"
+                            ? L"WorkSpaces"
+                            : L"WorkSpaces (Modified)";
+        AddUniquePhotoshopRestoreRelativePath(paths,
+                                              JoinRelativePathParts(aliasParts, aliasParts.size()));
+        AddLegacyWorkspaceNoExtensionAlias(paths, aliasParts, targetLabel);
+    }
+
+    std::wstring ext = ExtensionLower(parts.back());
+    if (!touchedWorkspace || ext != L".psw") return;
+
+    std::wstring fileName = parts.back();
+    std::wstring stem = fileName;
+    size_t dot = fileName.find_last_of(L'.');
+    if (dot != std::wstring::npos) stem = fileName.substr(0, dot);
+    if (EndsWithCaseInsensitive(stem, L" (Modified)")) {
+        std::vector<std::wstring> aliasParts = parts;
+        std::wstring unmodifiedFileName = stem.substr(0, stem.size() - 11) + ext;
+        aliasParts.back() = unmodifiedFileName;
+        AddUniquePhotoshopRestoreRelativePath(paths,
+                                              JoinRelativePathParts(aliasParts, aliasParts.size()));
+        AddLegacyWorkspaceNoExtensionAlias(paths, aliasParts, targetLabel);
+        for (size_t index : workspaceIndexes) {
+            std::vector<std::wstring> combinedParts = aliasParts;
+            std::wstring lower = LowerWide(combinedParts[index]);
+            combinedParts[index] = lower == L"workspaces (modified)"
+                                       ? L"WorkSpaces"
+                                       : L"WorkSpaces (Modified)";
+            AddUniquePhotoshopRestoreRelativePath(
+                paths, JoinRelativePathParts(combinedParts, combinedParts.size()));
+            AddLegacyWorkspaceNoExtensionAlias(paths, combinedParts, targetLabel);
+        }
+    } else {
+        std::vector<std::wstring> aliasParts = parts;
+        aliasParts.back() = stem + L" (Modified)" + ext;
+        AddUniquePhotoshopRestoreRelativePath(paths,
+                                              JoinRelativePathParts(aliasParts, aliasParts.size()));
+        AddLegacyWorkspaceNoExtensionAlias(paths, aliasParts, targetLabel);
+        for (size_t index : workspaceIndexes) {
+            std::vector<std::wstring> combinedParts = aliasParts;
+            std::wstring lower = LowerWide(combinedParts[index]);
+            combinedParts[index] = lower == L"workspaces (modified)"
+                                       ? L"WorkSpaces"
+                                       : L"WorkSpaces (Modified)";
+            AddUniquePhotoshopRestoreRelativePath(
+                paths, JoinRelativePathParts(combinedParts, combinedParts.size()));
+            AddLegacyWorkspaceNoExtensionAlias(paths, combinedParts, targetLabel);
+        }
+    }
+}
+
+std::vector<std::wstring> BuildPhotoshopSettingsRestoreRelativePaths(
+    const std::wstring& primaryPath, const std::wstring& sourceLabel,
+    const std::wstring& targetLabel) {
+    std::vector<std::wstring> paths;
+    AddUniquePhotoshopRestoreRelativePath(paths, primaryPath);
+
+    if (ShouldRewritePhotoshopVersionLabel(sourceLabel, targetLabel)) {
+        AddPhotoshopVersionFilenameAliases(paths, primaryPath, targetLabel);
+    }
+
+    AddWorkspaceCompatibilityAliases(paths, primaryPath, targetLabel);
+    return paths;
+}
+
+bool LooksLikePhotoshopWorkspaceXml(const std::wstring& text) {
+    return text.find(L"<photoshop-workspace") != std::wstring::npos;
+}
+
+std::wstring LegacyWorkspaceXmlIdForValue(const std::wstring& value,
+                                          std::map<std::wstring, std::wstring>& idMap) {
+    if (value.empty()) return L"";
+    if (value.size() > 8 || (value.size() > 1 && value.front() == L'0')) return L"";
+    unsigned long long numeric = 0;
+    for (wchar_t ch : value) {
+        if (!iswdigit(ch)) return L"";
+        numeric = numeric * 10ull + static_cast<unsigned long long>(ch - L'0');
+        if (numeric > 0x00FFFFFFull) return L"";
+    }
+
+    auto existing = idMap.find(value);
+    if (existing != idMap.end()) return existing->second;
+
+    wchar_t buffer[32] = {};
+    swprintf(buffer, std::size(buffer), L"%016llX",
+             static_cast<unsigned long long>(0x01000000ull + numeric));
+    std::wstring mapped = buffer;
+    idMap[value] = mapped;
+    return mapped;
+}
+
+bool RewriteDecimalXmlAttributeValues(std::wstring& text, const std::wstring& attribute,
+                                      std::map<std::wstring, std::wstring>& idMap) {
+    bool changed = false;
+    std::wstring needle = attribute + L"=\"";
+    size_t pos = 0;
+    while ((pos = text.find(needle, pos)) != std::wstring::npos) {
+        size_t valueStart = pos + needle.size();
+        size_t valueEnd = text.find(L'"', valueStart);
+        if (valueEnd == std::wstring::npos) break;
+
+        std::wstring value = text.substr(valueStart, valueEnd - valueStart);
+        std::wstring mapped = LegacyWorkspaceXmlIdForValue(value, idMap);
+        if (!mapped.empty() && mapped != value) {
+            text.replace(valueStart, value.size(), mapped);
+            valueEnd = valueStart + mapped.size();
+            changed = true;
+        }
+        pos = valueEnd + 1;
+    }
+    return changed;
+}
+
+bool HasRewriteableDecimalXmlAttributeValue(const std::wstring& text,
+                                            const std::wstring& attribute) {
+    std::map<std::wstring, std::wstring> scratchMap;
+    std::wstring needle = attribute + L"=\"";
+    size_t pos = 0;
+    while ((pos = text.find(needle, pos)) != std::wstring::npos) {
+        size_t valueStart = pos + needle.size();
+        size_t valueEnd = text.find(L'"', valueStart);
+        if (valueEnd == std::wstring::npos) break;
+
+        std::wstring value = text.substr(valueStart, valueEnd - valueStart);
+        if (!LegacyWorkspaceXmlIdForValue(value, scratchMap).empty()) return true;
+        pos = valueEnd + 1;
+    }
+    return false;
+}
+
+bool RemoveXmlAttributeFromTags(std::wstring& text, const std::wstring& tagName,
+                                const std::wstring& attribute) {
+    bool changed = false;
+    std::wstring tagNeedle = L"<" + tagName;
+    std::wstring attributeNeedle = L" " + attribute + L"=\"";
+    size_t pos = 0;
+    while ((pos = text.find(tagNeedle, pos)) != std::wstring::npos) {
+        size_t nameEnd = pos + tagNeedle.size();
+        if (nameEnd < text.size() && !iswspace(text[nameEnd]) &&
+            text[nameEnd] != L'>' && text[nameEnd] != L'/') {
+            pos = nameEnd;
+            continue;
+        }
+
+        size_t tagEnd = text.find(L'>', nameEnd);
+        if (tagEnd == std::wstring::npos) break;
+        size_t attributePos = text.find(attributeNeedle, nameEnd);
+        if (attributePos == std::wstring::npos || attributePos > tagEnd) {
+            pos = tagEnd + 1;
+            continue;
+        }
+        size_t valueEnd = text.find(L'"', attributePos + attributeNeedle.size());
+        if (valueEnd == std::wstring::npos || valueEnd > tagEnd) {
+            pos = tagEnd + 1;
+            continue;
+        }
+        text.erase(attributePos, valueEnd - attributePos + 1);
+        changed = true;
+        pos = attributePos;
+    }
+    return changed;
+}
+
+bool ClampNegativeOriginAttributes(std::wstring& text) {
+    bool changed = false;
+    std::wstring needle = L"origin=\"";
+    size_t pos = 0;
+    while ((pos = text.find(needle, pos)) != std::wstring::npos) {
+        size_t valueStart = pos + needle.size();
+        size_t valueEnd = text.find(L'"', valueStart);
+        if (valueEnd == std::wstring::npos) break;
+
+        std::wstring value = text.substr(valueStart, valueEnd - valueStart);
+        wchar_t* end = nullptr;
+        long x = wcstol(value.c_str(), &end, 10);
+        if (end == value.c_str()) {
+            pos = valueEnd + 1;
+            continue;
+        }
+        while (*end && iswspace(*end)) ++end;
+        wchar_t* end2 = nullptr;
+        long y = wcstol(end, &end2, 10);
+        if (end2 == end) {
+            pos = valueEnd + 1;
+            continue;
+        }
+        while (*end2 && iswspace(*end2)) ++end2;
+        if (*end2 != L'\0') {
+            pos = valueEnd + 1;
+            continue;
+        }
+
+        long clampedX = std::max<long>(0, x);
+        long clampedY = std::max<long>(0, y);
+        if (clampedX != x || clampedY != y) {
+            std::wstring replacement = std::to_wstring(clampedX) + L" " +
+                                       std::to_wstring(clampedY);
+            text.replace(valueStart, value.size(), replacement);
+            valueEnd = valueStart + replacement.size();
+            changed = true;
+        }
+        pos = valueEnd + 1;
+    }
+    return changed;
+}
+
+int Base64Value(wchar_t ch) {
+    if (ch >= L'A' && ch <= L'Z') return static_cast<int>(ch - L'A');
+    if (ch >= L'a' && ch <= L'z') return static_cast<int>(ch - L'a') + 26;
+    if (ch >= L'0' && ch <= L'9') return static_cast<int>(ch - L'0') + 52;
+    if (ch == L'+') return 62;
+    if (ch == L'/') return 63;
+    return -1;
+}
+
+bool DecodeBase64Value(const std::wstring& value, std::vector<uint8_t>& output) {
+    output.clear();
+    uint32_t accumulator = 0;
+    int bits = -8;
+    for (wchar_t ch : value) {
+        if (ch == L'=') break;
+        if (iswspace(ch)) continue;
+        int decoded = Base64Value(ch);
+        if (decoded < 0) return false;
+        accumulator = ((accumulator << 6) | static_cast<uint32_t>(decoded)) & 0x00FFFFFFu;
+        bits += 6;
+        if (bits >= 0) {
+            output.push_back(static_cast<uint8_t>((accumulator >> bits) & 0xFF));
+            bits -= 8;
+        }
+    }
+    return true;
+}
+
+bool IsPanelIdChar(wchar_t ch) {
+    return (ch >= L'a' && ch <= L'z') ||
+           (ch >= L'A' && ch <= L'Z') ||
+           (ch >= L'0' && ch <= L'9') ||
+           ch == L'.' || ch == L'_' || ch == L'-';
+}
+
+bool MatchesUtf16LeAt(const std::vector<uint8_t>& bytes, size_t pos,
+                      const std::wstring& needle) {
+    if (pos + needle.size() * 2 > bytes.size()) return false;
+    for (size_t i = 0; i < needle.size(); ++i) {
+        wchar_t actual = static_cast<wchar_t>(bytes[pos + i * 2] |
+                                             (bytes[pos + i * 2 + 1] << 8));
+        if (actual != needle[i]) return false;
+    }
+    return true;
+}
+
+std::wstring ExtractWorkspacePanelIdFromAppData(const std::wstring& appData) {
+    std::vector<uint8_t> decoded;
+    if (!DecodeBase64Value(appData, decoded)) return L"";
+
+    const std::wstring needle = L"panelid.";
+    for (size_t pos = 0; pos + needle.size() * 2 <= decoded.size(); ++pos) {
+        if (!MatchesUtf16LeAt(decoded, pos, needle)) continue;
+
+        std::wstring panelId;
+        for (size_t i = pos; i + 1 < decoded.size(); i += 2) {
+            wchar_t ch = static_cast<wchar_t>(decoded[i] | (decoded[i + 1] << 8));
+            if (ch == L'\0' || !IsPanelIdChar(ch)) break;
+            panelId.push_back(ch);
+        }
+        return panelId;
+    }
+    return L"";
+}
+
+std::wstring XmlAttributeValue(const std::wstring& tag, const std::wstring& attribute) {
+    std::wstring needle = attribute + L"=\"";
+    size_t pos = tag.find(needle);
+    if (pos == std::wstring::npos) return L"";
+    size_t valueStart = pos + needle.size();
+    size_t valueEnd = tag.find(L'"', valueStart);
+    if (valueEnd == std::wstring::npos) return L"";
+    return tag.substr(valueStart, valueEnd - valueStart);
+}
+
+bool IsXmlTagAt(const std::wstring& text, size_t pos, const std::wstring& tagName) {
+    std::wstring needle = L"<" + tagName;
+    if (text.compare(pos, needle.size(), needle) != 0) return false;
+    size_t nameEnd = pos + needle.size();
+    return nameEnd >= text.size() || iswspace(text[nameEnd]) ||
+           text[nameEnd] == L'>' || text[nameEnd] == L'/';
+}
+
+bool ReplaceXmlAttributeValueInRange(std::wstring& text, size_t begin, size_t end,
+                                     const std::wstring& attribute,
+                                     const std::wstring& value);
+
+std::wstring LegacyWorkspaceXmlIdForPanelId(const std::wstring& panelId) {
+    struct PanelIdMap {
+        const wchar_t* panelId;
+        const wchar_t* legacyId;
+    };
+    static const PanelIdMap kPanelIds[] = {
+        {L"panelid.static.options", L"0000000000E711EA"},
+        {L"panelid.static.animation", L"0000000000340FDC"},
+        {L"panelid.static.toolbar", L"00000000000616F0"},
+        {L"panelid.static.layers", L"0000000000090F0E"},
+        {L"panelid.static.navigator", L"000000000004158A"},
+        {L"panelid.static.histogram", L"0000000000500DAA"},
+        {L"panelid.static.properties", L"0000000000121586"},
+        {L"panelid.static.info", L"0000000000120ED4"},
+        {L"panelid.static.brushstyler", L"00000000002B1206"},
+        {L"panelid.static.brushpresets", L"00000000001E128E"},
+        {L"panelid.static.clonesource", L"00000000000F11A0"},
+        {L"panelid.static.textcharacter", L"0000000000180DD2"},
+        {L"panelid.static.textparagraph", L"0000000000101144"},
+        {L"panelid.static.textparastyle", L"0000000000061118"},
+        {L"panelid.static.textcharstyle", L"0000000000031502"},
+        {L"panelid.static.comps", L"0000000000081554"},
+        {L"panelid.static.annotation", L"0000000000061534"},
+        {L"panelid.dynamic.swf.csxs.klr", L"00000000003416EC"},
+        {L"panelid.static.blrb", L"0000000000051606"},
+        {L"panelid.static.blb2", L"00000000002714A2"},
+        {L"panelid.static.3d", L"0000000000071034"},
+        {L"panelid.static.toolpresets", L"00000000008714D6"},
+        {L"panelid.static.picker", L"0000000000071322"},
+        {L"panelid.static.swatches", L"0000000000490E08"},
+        {L"panelid.static.create", L"00000000000C1558"},
+        {L"panelid.static.styles", L"000000000006151E"},
+        {L"panelid.static.channels", L"0000000000120EDA"},
+        {L"panelid.static.paths", L"00000000000D1054"},
+        {L"panelid.static.history", L"00000000000A101E"},
+        {L"panelid.static.actions", L"0000000000070E42"},
+        {L"panelid.dynamic.swf.csxs.minibr", L"0000000000080D1C"},
+    };
+
+    std::wstring lower = LowerWide(panelId);
+    for (const auto& item : kPanelIds) {
+        if (lower == item.panelId) return item.legacyId;
+    }
+    return L"";
+}
+
+bool RewriteWorkspaceElementIdsFromPanelIds(std::wstring& text,
+                                            std::map<std::wstring, std::wstring>& idMap) {
+    bool changed = false;
+    const std::wstring tagNames[] = {L"control-bar", L"toolbar", L"palette"};
+    for (const auto& tagName : tagNames) {
+        size_t pos = 0;
+        while ((pos = text.find(L"<" + tagName, pos)) != std::wstring::npos) {
+            if (!IsXmlTagAt(text, pos, tagName)) {
+                pos += tagName.size() + 1;
+                continue;
+            }
+
+            size_t tagEnd = text.find(L'>', pos);
+            if (tagEnd == std::wstring::npos) break;
+            std::wstring tag = text.substr(pos, tagEnd - pos + 1);
+            std::wstring id = XmlAttributeValue(tag, L"id");
+            std::wstring appData = XmlAttributeValue(tag, L"app-data");
+            std::wstring panelId = ExtractWorkspacePanelIdFromAppData(appData);
+            std::wstring legacyId = LegacyWorkspaceXmlIdForPanelId(panelId);
+            if (!id.empty() && !legacyId.empty()) {
+                idMap[id] = legacyId;
+                if (id != legacyId &&
+                    ReplaceXmlAttributeValueInRange(text, pos, tagEnd, L"id", legacyId)) {
+                    changed = true;
+                    tagEnd = text.find(L'>', pos);
+                    if (tagEnd == std::wstring::npos) break;
+                }
+            }
+            pos = tagEnd + 1;
+        }
+    }
+    return changed;
+}
+
+bool IsUnsupportedLegacyWorkspacePanelId(const std::wstring& panelId) {
+    std::wstring lower = LowerWide(panelId);
+    if (lower.empty()) return false;
+
+    if (lower == L"panelid.dynamic.uxp" ||
+        lower.rfind(L"panelid.dynamic.uxp.", 0) == 0) {
+        return true;
+    }
+    if (lower.rfind(L"panelid.dynamic.swf.csxs.com.adobe.designlibraries", 0) == 0 ||
+        lower.rfind(L"panelid.dynamic.swf.csxs.typer", 0) == 0) {
+        return true;
+    }
+
+    const wchar_t* unsupportedStaticPanels[] = {
+        L"panelid.static.measurement",
+        L"panelid.static.ocio",
+        L"panelid.static.customshapes",
+        L"panelid.static.textglyphspanel",
+        L"panelid.static.patchmatchfillpreview",
+        L"panelid.static.smartbrush",
+        L"panelid.static.patchmatch",
+        L"panelid.static.gradients",
+        L"panelid.static.patterns",
+    };
+    for (const wchar_t* unsupported : unsupportedStaticPanels) {
+        if (lower == unsupported) return true;
+    }
+    return false;
+}
+
+void EraseXmlTagWithLineWhitespace(std::wstring& text, size_t tagStart, size_t tagEnd) {
+    size_t removeStart = tagStart;
+    size_t lineStart = text.rfind(L'\n', tagStart);
+    lineStart = lineStart == std::wstring::npos ? 0 : lineStart + 1;
+    bool onlyIndentBefore = true;
+    for (size_t i = lineStart; i < tagStart; ++i) {
+        if (!iswspace(text[i])) {
+            onlyIndentBefore = false;
+            break;
+        }
+    }
+    if (onlyIndentBefore) removeStart = lineStart;
+
+    size_t removeEnd = tagEnd + 1;
+    size_t lineEnd = text.find(L'\n', removeEnd);
+    if (lineEnd != std::wstring::npos) {
+        bool onlyWhitespaceAfter = true;
+        for (size_t i = removeEnd; i < lineEnd; ++i) {
+            if (!iswspace(text[i])) {
+                onlyWhitespaceAfter = false;
+                break;
+            }
+        }
+        if (onlyWhitespaceAfter) removeEnd = lineEnd + 1;
+    }
+    text.erase(removeStart, removeEnd - removeStart);
+}
+
+std::wstring FirstPaletteIdInRange(const std::wstring& text, size_t begin, size_t end) {
+    size_t pos = begin;
+    while ((pos = text.find(L"<palette", pos)) != std::wstring::npos && pos < end) {
+        if (!IsXmlTagAt(text, pos, L"palette")) {
+            pos += 8;
+            continue;
+        }
+        size_t tagEnd = text.find(L'>', pos);
+        if (tagEnd == std::wstring::npos || tagEnd > end) return L"";
+        std::wstring id = XmlAttributeValue(text.substr(pos, tagEnd - pos + 1), L"id");
+        if (!id.empty()) return id;
+        pos = tagEnd + 1;
+    }
+    return L"";
+}
+
+bool ReplaceXmlAttributeValueInRange(std::wstring& text, size_t begin, size_t end,
+                                     const std::wstring& attribute,
+                                     const std::wstring& value) {
+    std::wstring needle = attribute + L"=\"";
+    size_t pos = text.find(needle, begin);
+    if (pos == std::wstring::npos || pos >= end) return false;
+    size_t valueStart = pos + needle.size();
+    size_t valueEnd = text.find(L'"', valueStart);
+    if (valueEnd == std::wstring::npos || valueEnd > end) return false;
+    text.replace(valueStart, valueEnd - valueStart, value);
+    return true;
+}
+
+bool FixLegacyWorkspaceTabGroups(std::wstring& text) {
+    bool changed = false;
+    size_t pos = 0;
+    while ((pos = text.find(L"<tab-group", pos)) != std::wstring::npos) {
+        if (!IsXmlTagAt(text, pos, L"tab-group")) {
+            pos += 10;
+            continue;
+        }
+        size_t startTagEnd = text.find(L'>', pos);
+        if (startTagEnd == std::wstring::npos) break;
+        size_t closeStart = text.find(L"</tab-group>", startTagEnd + 1);
+        if (closeStart == std::wstring::npos) break;
+        size_t closeEnd = closeStart + std::wstring(L"</tab-group>").size();
+        std::wstring firstPaletteId = FirstPaletteIdInRange(text, startTagEnd + 1, closeStart);
+        if (firstPaletteId.empty()) {
+            EraseXmlTagWithLineWhitespace(text, pos, closeEnd - 1);
+            changed = true;
+            continue;
+        }
+
+        std::wstring startTag = text.substr(pos, startTagEnd - pos + 1);
+        std::wstring activePalette = XmlAttributeValue(startTag, L"active-palette");
+        bool activeExists = false;
+        if (!activePalette.empty()) {
+            size_t search = startTagEnd + 1;
+            while ((search = text.find(L"<palette", search)) != std::wstring::npos &&
+                   search < closeStart) {
+                if (!IsXmlTagAt(text, search, L"palette")) {
+                    search += 8;
+                    continue;
+                }
+                size_t paletteEnd = text.find(L'>', search);
+                if (paletteEnd == std::wstring::npos || paletteEnd > closeStart) break;
+                std::wstring id =
+                    XmlAttributeValue(text.substr(search, paletteEnd - search + 1), L"id");
+                if (id == activePalette) {
+                    activeExists = true;
+                    break;
+                }
+                search = paletteEnd + 1;
+            }
+        }
+        if (!activeExists &&
+            ReplaceXmlAttributeValueInRange(text, pos, startTagEnd, L"active-palette",
+                                            firstPaletteId)) {
+            changed = true;
+            startTagEnd = text.find(L'>', pos);
+            closeStart = text.find(L"</tab-group>", startTagEnd + 1);
+            closeEnd = closeStart == std::wstring::npos
+                           ? closeEnd
+                           : closeStart + std::wstring(L"</tab-group>").size();
+        }
+        pos = closeEnd;
+    }
+    return changed;
+}
+
+bool RemoveEmptyXmlElements(std::wstring& text, const std::wstring& tagName,
+                            const std::wstring& requiredNeedle) {
+    bool changed = false;
+    size_t pos = 0;
+    std::wstring closeTag = L"</" + tagName + L">";
+    while ((pos = text.find(L"<" + tagName, pos)) != std::wstring::npos) {
+        if (!IsXmlTagAt(text, pos, tagName)) {
+            pos += tagName.size() + 1;
+            continue;
+        }
+        size_t startTagEnd = text.find(L'>', pos);
+        if (startTagEnd == std::wstring::npos) break;
+        size_t closeStart = text.find(closeTag, startTagEnd + 1);
+        if (closeStart == std::wstring::npos) break;
+        size_t closeEnd = closeStart + closeTag.size();
+        if (text.find(requiredNeedle, startTagEnd + 1) == std::wstring::npos ||
+            text.find(requiredNeedle, startTagEnd + 1) >= closeStart) {
+            EraseXmlTagWithLineWhitespace(text, pos, closeEnd - 1);
+            changed = true;
+            continue;
+        }
+        pos = closeEnd;
+    }
+    return changed;
+}
+
+bool RemoveUnsupportedLegacyWorkspacePalettes(std::wstring& text) {
+    bool changed = false;
+    size_t pos = 0;
+    while ((pos = text.find(L"<palette", pos)) != std::wstring::npos) {
+        if (!IsXmlTagAt(text, pos, L"palette")) {
+            pos += 8;
+            continue;
+        }
+        size_t tagEnd = text.find(L'>', pos);
+        if (tagEnd == std::wstring::npos) break;
+        std::wstring tag = text.substr(pos, tagEnd - pos + 1);
+        std::wstring appData = XmlAttributeValue(tag, L"app-data");
+        std::wstring panelId = ExtractWorkspacePanelIdFromAppData(appData);
+        if (IsUnsupportedLegacyWorkspacePanelId(panelId)) {
+            EraseXmlTagWithLineWhitespace(text, pos, tagEnd);
+            changed = true;
+            continue;
+        }
+        pos = tagEnd + 1;
+    }
+
+    if (changed) {
+        changed = FixLegacyWorkspaceTabGroups(text) || changed;
+        changed = RemoveEmptyXmlElements(text, L"tab-pane", L"<palette") || changed;
+    }
+    return changed;
+}
+
+bool RemoveEmptyWorkspaceDocks(std::wstring& text) {
+    bool changed = false;
+    size_t pos = 0;
+    const std::wstring closeTag = L"</dock>";
+    while ((pos = text.find(L"<dock", pos)) != std::wstring::npos) {
+        if (!IsXmlTagAt(text, pos, L"dock")) {
+            pos += 5;
+            continue;
+        }
+        size_t startTagEnd = text.find(L'>', pos);
+        if (startTagEnd == std::wstring::npos) break;
+        size_t closeStart = text.find(closeTag, startTagEnd + 1);
+        if (closeStart == std::wstring::npos) break;
+        size_t closeEnd = closeStart + closeTag.size();
+
+        bool hasUsableChild =
+            text.find(L"<palette", startTagEnd + 1) < closeStart ||
+            text.find(L"<toolbar", startTagEnd + 1) < closeStart ||
+            text.find(L"<control-bar", startTagEnd + 1) < closeStart;
+        if (!hasUsableChild) {
+            EraseXmlTagWithLineWhitespace(text, pos, closeEnd - 1);
+            changed = true;
+            continue;
+        }
+        pos = closeEnd;
+    }
+    return changed;
+}
+
+bool NormalizeLegacyControlBarOrigin(std::wstring& text) {
+    bool changed = false;
+    size_t pos = 0;
+    while ((pos = text.find(L"<control-bar", pos)) != std::wstring::npos) {
+        if (!IsXmlTagAt(text, pos, L"control-bar")) {
+            pos += 12;
+            continue;
+        }
+        size_t tagEnd = text.find(L'>', pos);
+        if (tagEnd == std::wstring::npos) break;
+        std::wstring tag = text.substr(pos, tagEnd - pos + 1);
+        std::wstring origin = XmlAttributeValue(tag, L"origin");
+        wchar_t* end = nullptr;
+        long x = wcstol(origin.c_str(), &end, 10);
+        if (end == origin.c_str()) {
+            pos = tagEnd + 1;
+            continue;
+        }
+        while (*end && iswspace(*end)) ++end;
+        wchar_t* end2 = nullptr;
+        long y = wcstol(end, &end2, 10);
+        if (end2 == end) {
+            pos = tagEnd + 1;
+            continue;
+        }
+        while (*end2 && iswspace(*end2)) ++end2;
+        if (*end2 == L'\0' && (x < 0 || y < 0) &&
+            ReplaceXmlAttributeValueInRange(text, pos, tagEnd, L"origin", L"0 28")) {
+            changed = true;
+            tagEnd = text.find(L'>', pos);
+        }
+        pos = tagEnd == std::wstring::npos ? text.size() : tagEnd + 1;
+    }
+    return changed;
+}
+
+std::vector<uint8_t> EncodeUtf8LikeOriginal(const std::vector<uint8_t>& original,
+                                            const std::wstring& text) {
+    std::string utf8 = WideToUtf8(text);
+    std::vector<uint8_t> encoded;
+    bool hadBom = original.size() >= 3 && original[0] == 0xEF &&
+                  original[1] == 0xBB && original[2] == 0xBF;
+    if (hadBom) {
+        encoded.push_back(0xEF);
+        encoded.push_back(0xBB);
+        encoded.push_back(0xBF);
+    }
+    encoded.insert(encoded.end(), utf8.begin(), utf8.end());
+    return encoded;
+}
+
+bool NormalizeLegacyWorkspaceXmlText(std::wstring& text) {
+    bool changed = false;
+    std::wstring before = text;
+    bool hasModernDecimalIds =
+        HasRewriteableDecimalXmlAttributeValue(text, L"id") ||
+        HasRewriteableDecimalXmlAttributeValue(text, L"active-palette");
+
+    std::wstring rewritten =
+        ReplaceAllCaseInsensitive(text,
+                                  L"<photoshop-workspace version=\"2.0\"",
+                                  L"<photoshop-workspace version=\"1.0\"");
+    rewritten = ReplaceAllCaseInsensitive(rewritten,
+                                           L"<photoshop-workspace version=\"2\"",
+                                           L"<photoshop-workspace version=\"1\"");
+    if (rewritten != text) {
+        text = std::move(rewritten);
+        changed = true;
+    }
+    rewritten = ReplaceAllCaseInsensitive(text, L"<workspace version=\"2.0\"",
+                                           L"<workspace version=\"1.0\"");
+    rewritten = ReplaceAllCaseInsensitive(rewritten, L"<workspace version=\"2\"",
+                                           L"<workspace version=\"1\"");
+    if (rewritten != text) {
+        text = std::move(rewritten);
+        changed = true;
+    }
+
+    changed = RemoveXmlAttributeFromTags(text, L"dock", L"origin") || changed;
+    changed = NormalizeLegacyControlBarOrigin(text) || changed;
+    changed = ClampNegativeOriginAttributes(text) || changed;
+    changed = RemoveUnsupportedLegacyWorkspacePalettes(text) || changed;
+
+    std::map<std::wstring, std::wstring> idMap;
+    if (hasModernDecimalIds) {
+        changed = RewriteWorkspaceElementIdsFromPanelIds(text, idMap) || changed;
+    }
+    changed = RewriteDecimalXmlAttributeValues(text, L"id", idMap) || changed;
+    changed = RewriteDecimalXmlAttributeValues(text, L"active-palette", idMap) || changed;
+    changed = FixLegacyWorkspaceTabGroups(text) || changed;
+    changed = RemoveEmptyXmlElements(text, L"tab-pane", L"<palette") || changed;
+    changed = RemoveEmptyWorkspaceDocks(text) || changed;
+
+    return changed && text != before;
+}
+
+size_t FindAsciiBytes(const std::vector<uint8_t>& bytes, const char* needle,
+                      size_t start = 0) {
+    size_t needleLen = strlen(needle);
+    if (needleLen == 0) return start <= bytes.size() ? start : std::string::npos;
+    if (start > bytes.size() || needleLen > bytes.size() - start) return std::string::npos;
+
+    const uint8_t first = static_cast<uint8_t>(needle[0]);
+    for (size_t i = start; i <= bytes.size() - needleLen; ++i) {
+        if (bytes[i] != first) continue;
+        if (memcmp(bytes.data() + i, needle, needleLen) == 0) return i;
+    }
+    return std::string::npos;
+}
+
+bool FindEmbeddedWorkspaceXmlRange(const std::vector<uint8_t>& bytes,
+                                   size_t& xmlStart, size_t& xmlEnd) {
+    xmlStart = FindAsciiBytes(bytes, "<workspace");
+    if (xmlStart == std::string::npos) return false;
+
+    size_t closeStart = FindAsciiBytes(bytes, "</workspace>", xmlStart);
+    if (closeStart == std::string::npos) return false;
+
+    xmlEnd = closeStart + strlen("</workspace>");
+    if (xmlEnd + 1 < bytes.size() && bytes[xmlEnd] == '\r' && bytes[xmlEnd + 1] == '\n') {
+        xmlEnd += 2;
+    } else if (xmlEnd < bytes.size() && (bytes[xmlEnd] == '\n' || bytes[xmlEnd] == '\r')) {
+        ++xmlEnd;
+    }
+    return xmlEnd > xmlStart && xmlEnd <= bytes.size();
+}
+
+uint32_t ReadBigEndianU32(const std::vector<uint8_t>& bytes, size_t offset) {
+    if (offset + 4 > bytes.size()) return 0;
+    return (static_cast<uint32_t>(bytes[offset]) << 24) |
+           (static_cast<uint32_t>(bytes[offset + 1]) << 16) |
+           (static_cast<uint32_t>(bytes[offset + 2]) << 8) |
+           static_cast<uint32_t>(bytes[offset + 3]);
+}
+
+void WriteBigEndianU32(std::vector<uint8_t>& bytes, size_t offset, uint32_t value) {
+    if (offset + 4 > bytes.size()) return;
+    bytes[offset] = static_cast<uint8_t>((value >> 24) & 0xFF);
+    bytes[offset + 1] = static_cast<uint8_t>((value >> 16) & 0xFF);
+    bytes[offset + 2] = static_cast<uint8_t>((value >> 8) & 0xFF);
+    bytes[offset + 3] = static_cast<uint8_t>(value & 0xFF);
+}
+
+void AppendBigEndianU32(std::vector<uint8_t>& bytes, uint32_t value) {
+    bytes.push_back(static_cast<uint8_t>((value >> 24) & 0xFF));
+    bytes.push_back(static_cast<uint8_t>((value >> 16) & 0xFF));
+    bytes.push_back(static_cast<uint8_t>((value >> 8) & 0xFF));
+    bytes.push_back(static_cast<uint8_t>(value & 0xFF));
+}
+
+void AppendAscii(std::vector<uint8_t>& bytes, const char* text) {
+    bytes.insert(bytes.end(), text, text + strlen(text));
+}
+
+std::vector<uint8_t> BuildLegacyWorkspacePrefsTail() {
+    std::vector<uint8_t> tail;
+    AppendBigEndianU32(tail, 0);
+    AppendAscii(tail, "Plt bool");
+    tail.push_back(1);
+    tail.push_back(0);
+    tail.push_back(0);
+    tail.push_back(0);
+    tail.push_back(0x15);
+    AppendAscii(tail, "keyboardCustomizationbool");
+    AppendBigEndianU32(tail, 0);
+    tail.push_back(0x11);
+    AppendAscii(tail, "menuCustomizationbool");
+    AppendBigEndianU32(tail, 0);
+    tail.push_back(0x19);
+    AppendAscii(tail, "workspacesDisabledPresetsVlLs");
+    AppendBigEndianU32(tail, 0);
+    return tail;
+}
+
+bool ByteRangeContainsAscii(const std::vector<uint8_t>& bytes, size_t begin,
+                            size_t end, const char* needle) {
+    if (begin > bytes.size()) return false;
+    end = std::min(end, bytes.size());
+    size_t found = FindAsciiBytes(bytes, needle, begin);
+    return found != std::string::npos && found + strlen(needle) <= end;
+}
+
+bool WorkspacePrefsTailHasModernOnlyKeys(const std::vector<uint8_t>& bytes,
+                                         size_t xmlEnd) {
+    return ByteRangeContainsAscii(bytes, xmlEnd, bytes.size(), "toolbarCustomizationbool");
+}
+
+bool WorkspacePrefsTemplateLooksLegacy(const std::vector<uint8_t>& bytes,
+                                       size_t xmlEnd) {
+    return bytes.size() >= 2 && bytes[0] == 0x00 && bytes[1] == 0x01 &&
+           !WorkspacePrefsTailHasModernOnlyKeys(bytes, xmlEnd);
+}
+
+bool PrefixEndsWithPspWorkspaceLengthField(const std::vector<uint8_t>& prefix,
+                                           size_t oldXmlLength) {
+    if (prefix.size() < 4) return false;
+    uint32_t storedLength = ReadBigEndianU32(prefix, prefix.size() - 4);
+    if (storedLength == oldXmlLength) return true;
+    if (prefix.size() < 8) return false;
+    const size_t token = prefix.size() - 8;
+    return prefix[token] == 't' && prefix[token + 1] == 'd' &&
+           prefix[token + 2] == 't' && prefix[token + 3] == 'a';
+}
+
+bool NormalizeEmbeddedWorkspacePrefsBytesForTarget(const std::vector<uint8_t>& raw,
+                                                   const std::wstring& targetPath,
+                                                   std::vector<uint8_t>& normalized) {
+    size_t sourceXmlStart = 0;
+    size_t sourceXmlEnd = 0;
+    if (!FindEmbeddedWorkspaceXmlRange(raw, sourceXmlStart, sourceXmlEnd) ||
+        sourceXmlStart == 0) {
+        return false;
+    }
+
+    std::string xmlUtf8(reinterpret_cast<const char*>(raw.data() + sourceXmlStart),
+                        reinterpret_cast<const char*>(raw.data() + sourceXmlEnd));
+    std::wstring xml = Utf8ToWide(xmlUtf8, true);
+    if (xml.empty()) return false;
+    if (xml.find(L"<workspace") == std::wstring::npos) return false;
+
+    bool xmlChanged = NormalizeLegacyWorkspaceXmlText(xml);
+    bool containerNeedsLegacyRewrite =
+        !WorkspacePrefsTemplateLooksLegacy(raw, sourceXmlEnd);
+    if (!xmlChanged && !containerNeedsLegacyRewrite) return false;
+    std::string normalizedXmlUtf8 = WideToUtf8(xml);
+
+    std::vector<uint8_t> templateBytes;
+    std::wstring ignoredError;
+    size_t templateXmlStart = sourceXmlStart;
+    size_t templateXmlEnd = sourceXmlEnd;
+    if (!targetPath.empty() && ReadFileBytes(targetPath, templateBytes, ignoredError)) {
+        size_t targetXmlStart = 0;
+        size_t targetXmlEnd = 0;
+        if (FindEmbeddedWorkspaceXmlRange(templateBytes, targetXmlStart, targetXmlEnd) &&
+            targetXmlStart > 0 &&
+            WorkspacePrefsTemplateLooksLegacy(templateBytes, targetXmlEnd)) {
+            templateXmlStart = targetXmlStart;
+            templateXmlEnd = targetXmlEnd;
+        } else {
+            templateBytes.clear();
+        }
+    }
+    const std::vector<uint8_t>& templateSource = templateBytes.empty() ? raw : templateBytes;
+
+    std::vector<uint8_t> prefix(templateSource.begin(),
+                                templateSource.begin() + templateXmlStart);
+    std::vector<uint8_t> tail(templateSource.begin() + templateXmlEnd,
+                              templateSource.end());
+    if (templateBytes.empty() && !WorkspacePrefsTemplateLooksLegacy(raw, sourceXmlEnd)) {
+        tail = BuildLegacyWorkspacePrefsTail();
+    }
+
+    if (prefix.size() >= 2) {
+        prefix[0] = 0x00;
+        prefix[1] = 0x01;
+    }
+    size_t oldTemplateXmlLength = templateXmlEnd - templateXmlStart;
+    if (PrefixEndsWithPspWorkspaceLengthField(prefix, oldTemplateXmlLength)) {
+        WriteBigEndianU32(prefix, prefix.size() - 4,
+                          static_cast<uint32_t>(normalizedXmlUtf8.size()));
+    }
+
+    normalized.clear();
+    normalized.reserve(prefix.size() + normalizedXmlUtf8.size() + tail.size());
+    normalized.insert(normalized.end(), prefix.begin(), prefix.end());
+    normalized.insert(normalized.end(), normalizedXmlUtf8.begin(), normalizedXmlUtf8.end());
+    normalized.insert(normalized.end(), tail.begin(), tail.end());
+    return normalized != raw;
+}
+
+enum class WorkspaceCompatibilityResult {
+    NotNeeded,
+    AlreadyCompatible,
+    Converted,
+    Incompatible,
+};
+
+bool IsWorkspaceTargetPath(const std::wstring& targetPath) {
+    std::vector<std::wstring> parts = SplitRelativePathParts(targetPath);
+    for (const auto& part : parts) {
+        if (IsWorkspaceDirectoryName(part)) return true;
+    }
+    std::wstring file = LowerWide(FileNameOnly(targetPath));
+    return ExtensionLower(file) == L".psw" ||
+           file.find(L"workspace prefs") != std::wstring::npos;
+}
+
+bool LooksLikeLegacyWorkspaceXml(const std::wstring& text) {
+    std::wstring lower = LowerWide(text);
+    return lower.find(L"<photoshop-workspace version=\"1") != std::wstring::npos ||
+           lower.find(L"<workspace version=\"1") != std::wstring::npos;
+}
+
+bool EmbeddedWorkspacePrefsAlreadyCompatible(const std::vector<uint8_t>& raw) {
+    size_t xmlStart = 0;
+    size_t xmlEnd = 0;
+    if (!FindEmbeddedWorkspaceXmlRange(raw, xmlStart, xmlEnd) || xmlStart == 0 ||
+        !WorkspacePrefsTemplateLooksLegacy(raw, xmlEnd)) {
+        return false;
+    }
+    std::string xmlUtf8(reinterpret_cast<const char*>(raw.data() + xmlStart),
+                        reinterpret_cast<const char*>(raw.data() + xmlEnd));
+    std::wstring xml = Utf8ToWide(xmlUtf8, true);
+    if (xml.empty() || !LooksLikeLegacyWorkspaceXml(xml)) return false;
+    std::wstring normalized = xml;
+    return !NormalizeLegacyWorkspaceXmlText(normalized);
+}
+
+WorkspaceCompatibilityResult PreparePhotoshopWorkspaceBytesForTarget(
+    const std::vector<uint8_t>& raw, const std::wstring& targetLabel,
+    const std::wstring& targetPath, std::vector<uint8_t>& normalized) {
+    normalized = raw;
+    if (!UsesLegacyPhotoshopWorkspaceNames(targetLabel) || raw.empty()) {
+        return WorkspaceCompatibilityResult::NotNeeded;
+    }
+
+    std::wstring text = DecodeTextBytes(raw);
+    bool standaloneWorkspace = LooksLikePhotoshopWorkspaceXml(text);
+    if (!standaloneWorkspace && !IsWorkspaceTargetPath(targetPath)) {
+        return WorkspaceCompatibilityResult::NotNeeded;
+    }
+
+    if (standaloneWorkspace) {
+        std::wstring converted = text;
+        if (NormalizeLegacyWorkspaceXmlText(converted)) {
+            normalized = EncodeUtf8LikeOriginal(raw, converted);
+            return WorkspaceCompatibilityResult::Converted;
+        }
+        return LooksLikeLegacyWorkspaceXml(text)
+                   ? WorkspaceCompatibilityResult::AlreadyCompatible
+                   : WorkspaceCompatibilityResult::Incompatible;
+    }
+
+    if (NormalizeEmbeddedWorkspacePrefsBytesForTarget(raw, targetPath, normalized)) {
+        return WorkspaceCompatibilityResult::Converted;
+    }
+    return EmbeddedWorkspacePrefsAlreadyCompatible(raw)
+               ? WorkspaceCompatibilityResult::AlreadyCompatible
+               : WorkspaceCompatibilityResult::Incompatible;
+}
+
+bool ExtractPhotoshopSettingsFolderRelativePath(const std::wstring& fileRelativePath,
+                                                std::wstring& settingsFolderRelativePath) {
+    settingsFolderRelativePath.clear();
+    std::wstring versionRoot;
+    std::wstring label;
+    if (!ExtractPhotoshopVersionInfo(fileRelativePath, versionRoot, label)) return false;
+
+    std::vector<std::wstring> rootParts = SplitRelativePathParts(versionRoot);
+    std::vector<std::wstring> pathParts = SplitRelativePathParts(fileRelativePath);
+    if (pathParts.size() <= rootParts.size()) return false;
+    if (!IsPhotoshopSettingsFolderSegment(pathParts[rootParts.size()])) return false;
+
+    settingsFolderRelativePath = JoinRelativePathParts(pathParts, rootParts.size() + 1);
+    return IsSafeRelativePath(settingsFolderRelativePath);
+}
+
+std::wstring EnsureTrailingBackslash(std::wstring path) {
+    if (!path.empty() && path.back() != L'\\' && path.back() != L'/') path.push_back(L'\\');
+    return path;
+}
+
+int FirstFourDigitYear(const std::wstring& text) {
+    for (size_t i = 0; i + 4 <= text.size(); ++i) {
+        if (!iswdigit(text[i]) || !iswdigit(text[i + 1]) ||
+            !iswdigit(text[i + 2]) || !iswdigit(text[i + 3])) {
+            continue;
+        }
+        int year = (text[i] - L'0') * 1000 + (text[i + 1] - L'0') * 100 +
+                   (text[i + 2] - L'0') * 10 + (text[i + 3] - L'0');
+        if (year >= 2014 && year <= 2035) return year;
+    }
+    return 0;
+}
+
+std::wstring PhotoshopRegistryVersionKeyFromLabel(const std::wstring& label) {
+    std::wstring normalized = NormalizePhotoshopVersionLabel(label);
+    std::wstring lower = LowerWide(normalized);
+    if (lower.find(L"cs6") != std::wstring::npos) return L"60.0";
+    if (lower.find(L"cs5.1") != std::wstring::npos) return L"55.0";
+    if (lower.find(L"cs5") != std::wstring::npos) return L"50.0";
+
+    int year = FirstFourDigitYear(normalized);
+    if (year > 0) return std::to_wstring((year - 2006) * 10) + L".0";
+    return L"";
+}
+
+bool SetRegistryStringValue(HKEY key, const wchar_t* valueName, const std::wstring& value) {
+    return RegSetValueExW(key, valueName, 0, REG_SZ,
+                          reinterpret_cast<const BYTE*>(value.c_str()),
+                          static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t))) ==
+           ERROR_SUCCESS;
+}
+
+bool SetPhotoshopSettingsFilePathForRegistryKey(const std::wstring& subKeyName,
+                                                const std::wstring& settingsFolder) {
+    if (subKeyName.empty() || settingsFolder.empty()) return false;
+    std::wstring keyPath = L"Software\\Adobe\\Photoshop\\" + subKeyName;
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, keyPath.c_str(), 0, nullptr, 0,
+                        KEY_SET_VALUE | KEY_QUERY_VALUE, nullptr, &key, nullptr) !=
+        ERROR_SUCCESS) {
+        return false;
+    }
+    std::wstring value = EnsureTrailingBackslash(settingsFolder);
+    bool ok = SetRegistryStringValue(key, L"SettingsFilePath", value);
+    RegCloseKey(key);
+    return ok;
+}
+
+uint32_t UpdatePhotoshopSettingsFilePathRegistry(
+    const std::wstring& targetLabel, const std::set<std::wstring>& settingsFolders) {
+    if (targetLabel.empty() || settingsFolders.empty()) return 0;
+
+    const std::wstring settingsFolder = *settingsFolders.begin();
+    std::set<std::wstring> keysToUpdate;
+    std::wstring mappedKey = PhotoshopRegistryVersionKeyFromLabel(targetLabel);
+    if (!mappedKey.empty()) keysToUpdate.insert(mappedKey);
+
+    HKEY photoshop = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Adobe\\Photoshop", 0,
+                      KEY_READ, &photoshop) == ERROR_SUCCESS) {
+        std::wstring targetLower = LowerWide(NormalizePhotoshopVersionLabel(targetLabel));
+        for (DWORD index = 0;; ++index) {
+            wchar_t subKeyName[256] = {};
+            DWORD subKeyLen = static_cast<DWORD>(std::size(subKeyName));
+            LONG rc = RegEnumKeyExW(photoshop, index, subKeyName, &subKeyLen,
+                                    nullptr, nullptr, nullptr, nullptr);
+            if (rc == ERROR_NO_MORE_ITEMS) break;
+            if (rc != ERROR_SUCCESS) continue;
+
+            HKEY subKey = nullptr;
+            if (RegOpenKeyExW(photoshop, subKeyName, 0, KEY_READ, &subKey) != ERROR_SUCCESS) {
+                continue;
+            }
+            std::wstring existingPath;
+            if (ReadRegistryStringValue(subKey, L"SettingsFilePath", existingPath)) {
+                std::wstring existingLower = LowerWide(existingPath);
+                if (!targetLower.empty() && existingLower.find(targetLower) != std::wstring::npos) {
+                    keysToUpdate.insert(std::wstring(subKeyName, subKeyLen));
+                }
+            }
+            RegCloseKey(subKey);
+        }
+        RegCloseKey(photoshop);
+    }
+
+    uint32_t updated = 0;
+    for (const auto& key : keysToUpdate) {
+        if (SetPhotoshopSettingsFilePathForRegistryKey(key, settingsFolder)) ++updated;
+    }
+    return updated;
+}
+
+std::wstring RestoreTargetRootForToken(const PtsRestoreOptions& options,
+                                        const std::wstring& rootToken) {
+    if (rootToken == L"APPDATA") return options.targetAppDataRelativeRoot;
+    if (rootToken == L"LOCALAPPDATA") return options.targetLocalAppDataRelativeRoot;
+    return L"";
+}
+
+bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& options,
+                             const PtsProgressCallback& progress,
+                             std::wstring& summary, std::wstring& error) {
+    bool archiveHasSettings = options.archiveHasSettings;
+    if (!options.archiveValidated) {
+        PtsArchiveScanResult preflight{};
+        if (!InspectPtsArchiveVersions(path, preflight, error, progress)) return false;
+        archiveHasSettings = preflight.hasSettings;
+    }
+
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                              nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        error = L"Không mở được file .afang.";
+        return false;
+    }
+
+    uint32_t count = 0;
+    if (!ReadPtsArchiveHeader(file, count, error)) {
+        CloseHandle(file);
+        return false;
+    }
+
+    const std::wstring appData = GetEnvPath(L"APPDATA");
+    const std::wstring localAppData = GetEnvPath(L"LOCALAPPDATA");
+    const std::wstring userFonts = JoinPath(localAppData, L"Microsoft\\Windows\\Fonts");
+    bool userFontDirectoryReady = false;
+    uint32_t restored = 0;
+    uint32_t fontRestored = 0;
+    uint32_t fontFilesWritten = 0;
+    uint32_t fontsAlreadyPresent = 0;
+    uint32_t settingsRestored = 0;
+    uint32_t skippedByVersion = 0;
+    uint32_t settingsCompatibilityAliases = 0;
+    uint32_t workspaceCompatibilityConversions = 0;
+    uint32_t registrySettingsPathUpdates = 0;
+    uint64_t restoredBytes = 0;
+    std::set<std::wstring> restoredSettingsRoots;
+    std::set<std::wstring> targetSettingsFoldersForRegistry;
+    std::vector<RestoredUserFont> fontsToRegister;
+
+    for (uint32_t i = 0; i < count; ++i) {
+        if (i == 0 || i + 1 == count || (i % 25) == 0) {
+            int percent = 5 + static_cast<int>(
+                (static_cast<uint64_t>(i) * 88) / std::max<uint32_t>(1, count));
+            progress(percent, L"Đang restore file " + std::to_wstring(i + 1) + L"/" +
+                                  std::to_wstring(count) + L"...");
+        }
+
+        uint8_t kindByte = 0;
+        std::wstring rootToken;
+        std::wstring relativePath;
+        std::wstring displayName;
+        uint64_t originalSize = 0;
+        uint64_t storedSize = 0;
+        uint8_t method = 0;
+        if (!ReadPtsArchiveEntryMetadata(file, kindByte, rootToken, relativePath, displayName,
+                                         originalSize, storedSize, method, error)) {
+            CloseHandle(file);
+            return false;
+        }
+
+        const bool isSetting =
+            kindByte == static_cast<uint8_t>(PtsEntryKind::PhotoshopSetting);
+        std::wstring sourceRelativeRoot;
+        std::wstring sourceLabel;
+        if (isSetting) {
+            if (!ExtractPhotoshopVersionInfo(relativePath, sourceRelativeRoot, sourceLabel)) {
+                CloseHandle(file);
+                error = L"Không xác định được version của settings trong .afang.";
+                return false;
+            }
+            std::wstring sourceVersionKey =
+                PtsPhotoshopVersionKey(rootToken, sourceRelativeRoot);
+            if (options.HasSourceFilter() &&
+                options.sourceVersionKeys.count(sourceVersionKey) == 0) {
+                if (!SkipFileBytes(file, storedSize)) {
+                    CloseHandle(file);
+                    error = L"File .afang bị thiếu dữ liệu.";
+                    return false;
+                }
+                ++skippedByVersion;
+                continue;
+            }
+        }
+
+        std::vector<uint8_t> stored(static_cast<size_t>(storedSize));
+        if (storedSize > 0 &&
+            !ReadAll(file, stored.data(), static_cast<DWORD>(stored.size()))) {
+            CloseHandle(file);
+            error = L"File .afang bị thiếu dữ liệu.";
+            return false;
+        }
+        std::vector<uint8_t> raw;
+        if (!DecompressFromArchive(stored, method, originalSize, raw)) {
+            CloseHandle(file);
+            error = L"Không giải nén được dữ liệu trong .afang.";
+            return false;
+        }
+
+        if (kindByte == static_cast<uint8_t>(PtsEntryKind::Font)) {
+            if (localAppData.empty()) {
+                CloseHandle(file);
+                error = L"Không tìm được thư mục font người dùng.";
+                return false;
+            }
+            if (!userFontDirectoryReady) {
+                if (!EnsureDirectoryExists(userFonts)) {
+                    CloseHandle(file);
+                    error = L"Không tạo được thư mục font người dùng.";
+                    return false;
+                }
+                userFontDirectoryReady = true;
+            }
+
+            const std::wstring desiredPath = JoinPath(userFonts, relativePath);
+            bool alreadyPresent = false;
+            std::wstring destination = ReusableOrNonConflictingFontPath(
+                desiredPath, raw, alreadyPresent);
+            if (destination.empty()) {
+                CloseHandle(file);
+                error = L"Không tìm được tên file trống để restore font.";
+                return false;
+            }
+            if (alreadyPresent) {
+                ++fontsAlreadyPresent;
+            } else {
+                if (!WriteBytesToFile(destination, raw, error)) {
+                    CloseHandle(file);
+                    error = L"Không ghi được font " + FileNameOnly(destination) + L".\n" + error;
+                    return false;
+                }
+                ++fontFilesWritten;
+                restoredBytes += raw.size();
+            }
+            fontsToRegister.push_back({destination, displayName});
+            ++fontRestored;
+            ++restored;
+            continue;
+        }
+
+        std::wstring destinationBasePath;
+        if (rootToken == L"APPDATA") {
+            destinationBasePath = appData;
+        } else if (rootToken == L"LOCALAPPDATA") {
+            destinationBasePath = localAppData;
+        }
+        if (destinationBasePath.empty()) {
+            CloseHandle(file);
+            error = rootToken == L"APPDATA"
+                        ? L"Không tìm được AppData để restore settings."
+                        : L"Không tìm được LocalAppData để restore settings.";
+            return false;
+        }
+
+        std::wstring destinationRelativePath = relativePath;
+        if (options.HasTargetMapping()) {
+            const std::wstring targetRoot = RestoreTargetRootForToken(options, rootToken);
+            if (!BuildMappedPhotoshopSettingsRelativePath(
+                    relativePath, sourceRelativeRoot, targetRoot, sourceLabel,
+                    options.targetVersionLabel, destinationRelativePath)) {
+                CloseHandle(file);
+                error = L"Không map được settings sang Photoshop version đã chọn.";
+                return false;
+            }
+        }
+        if (!IsAllowedPhotoshopSettingsRelativePath(destinationRelativePath)) {
+            CloseHandle(file);
+            error = L"Đường dẫn restore Photoshop settings không hợp lệ.";
+            return false;
+        }
+
+        std::vector<std::wstring> destinationRelativePaths;
+        if (options.HasTargetMapping()) {
+            destinationRelativePaths = BuildPhotoshopSettingsRestoreRelativePaths(
+                destinationRelativePath, sourceLabel, options.targetVersionLabel);
+        } else {
+            AddUniquePhotoshopRestoreRelativePath(destinationRelativePaths,
+                                                  destinationRelativePath);
+        }
+        if (destinationRelativePaths.empty()) {
+            CloseHandle(file);
+            error = L"Không tạo được đường dẫn restore Photoshop settings.";
+            return false;
+        }
+
+        bool convertedWorkspaceForEntry = false;
+        for (const auto& targetRelativePath : destinationRelativePaths) {
+            if (!IsAllowedPhotoshopSettingsRelativePath(targetRelativePath)) {
+                CloseHandle(file);
+                error = L"Alias restore Photoshop settings không hợp lệ.";
+                return false;
+            }
+            const std::wstring targetPath =
+                JoinPath(destinationBasePath, targetRelativePath);
+            std::vector<uint8_t> bytesToWrite = raw;
+            if (options.HasTargetMapping()) {
+                std::vector<uint8_t> normalized;
+                WorkspaceCompatibilityResult compatibility =
+                    PreparePhotoshopWorkspaceBytesForTarget(
+                        raw, options.targetVersionLabel, targetPath, normalized);
+                if (compatibility == WorkspaceCompatibilityResult::Converted) {
+                    bytesToWrite.swap(normalized);
+                    convertedWorkspaceForEntry = true;
+                } else if (compatibility == WorkspaceCompatibilityResult::Incompatible) {
+                    CloseHandle(file);
+                    error = L"Workspace không tương thích với Photoshop đích.\n" +
+                            FileNameOnly(targetPath);
+                    return false;
+                }
+            }
+            if (!WriteBytesToFile(targetPath, bytesToWrite, error)) {
+                CloseHandle(file);
+                return false;
+            }
+
+            if (options.HasTargetMapping() && rootToken == L"APPDATA") {
+                std::wstring settingsFolderRelativePath;
+                if (ExtractPhotoshopSettingsFolderRelativePath(
+                        targetRelativePath, settingsFolderRelativePath)) {
+                    targetSettingsFoldersForRegistry.insert(
+                        JoinPath(appData, settingsFolderRelativePath));
+                }
+            }
+        }
+
+        if (convertedWorkspaceForEntry) ++workspaceCompatibilityConversions;
+        if (destinationRelativePaths.size() > 1) {
+            settingsCompatibilityAliases +=
+                static_cast<uint32_t>(destinationRelativePaths.size() - 1);
+        }
+        std::wstring restoredRoot;
+        std::wstring restoredLabel;
+        if (ExtractPhotoshopVersionInfo(destinationRelativePath, restoredRoot, restoredLabel)) {
+            restoredSettingsRoots.insert(rootToken + L"\\" + restoredRoot);
+        }
+        ++settingsRestored;
+        ++restored;
+        restoredBytes += raw.size();
+    }
+
+    CloseHandle(file);
+    if (options.HasTargetMapping() && settingsRestored == 0 && archiveHasSettings) {
+        error = L"Không có settings phù hợp với Photoshop version đã chọn.";
+        return false;
+    }
+    if (restored == 0) {
+        error = L"Không có dữ liệu phù hợp để restore.";
+        return false;
+    }
+
+    FontRegistrationResult fontRegistration{};
+    if (!fontsToRegister.empty()) {
+        progress(95, L"Đang đăng ký font cho người dùng hiện tại...");
+        fontRegistration = RegisterRestoredUserFonts(fontsToRegister, progress);
+        DWORD_PTR unused = 0;
+        SendMessageTimeoutW(HWND_BROADCAST, WM_FONTCHANGE, 0, 0,
+                            SMTO_ABORTIFHUNG, 1000, &unused);
+    }
+
+    if (options.HasTargetMapping() && settingsRestored > 0 &&
+        !targetSettingsFoldersForRegistry.empty()) {
+        progress(97, L"Đang cập nhật SettingsFilePath...");
+        registrySettingsPathUpdates = UpdatePhotoshopSettingsFilePathRegistry(
+            options.targetVersionLabel, targetSettingsFoldersForRegistry);
+    }
+
+    progress(100, L"Hoàn tất restore .afang.");
+    summary = L"Đã restore " + std::to_wstring(restored) + L" file (" +
+              FormatBytes(restoredBytes) + L").";
+    if (settingsRestored > 0 || fontRestored > 0) {
+        summary += L" Settings: " + std::to_wstring(settingsRestored) +
+                   L", font: " + std::to_wstring(fontRestored) + L".";
+    }
+    std::wstring detail;
+    if (!options.sourceVersionLabel.empty() && !options.targetVersionLabel.empty()) {
+        detail = options.sourceVersionLabel + L" → " + options.targetVersionLabel + L".";
+    }
+    if (workspaceCompatibilityConversions > 0) {
+        detail += L" Đã chuyển " + std::to_wstring(workspaceCompatibilityConversions) +
+                  L" workspace.";
+    }
+    if (settingsCompatibilityAliases > 0) {
+        detail += L" Đã tạo " + std::to_wstring(settingsCompatibilityAliases) + L" alias.";
+    }
+    if (!targetSettingsFoldersForRegistry.empty()) {
+        detail += registrySettingsPathUpdates > 0
+                      ? L" Đã cập nhật SettingsFilePath."
+                      : L" Registry chưa có SettingsFilePath phù hợp.";
+    }
+    if (fontsAlreadyPresent > 0) {
+        detail += L" Bỏ qua " + std::to_wstring(fontsAlreadyPresent) + L" font đã có.";
+    }
+    if (fontRestored > 0 && fontRegistration.resourceRegistrations == 0) {
+        detail += L" Font đã chép; Windows chưa nạp ngay.";
+    }
+    if (fontFilesWritten > 0 && fontRegistration.registryUpdates == 0) {
+        detail += L" Registry font chưa cập nhật.";
+    }
+    if (skippedByVersion > 0) {
+        detail += L" Bỏ qua " + std::to_wstring(skippedByVersion) + L" settings khác version.";
+    }
+    if (!detail.empty()) summary += L"\n" + detail;
+    summary = CompactPtsNotice(summary);
+    return true;
+}
+
 constexpr DWORD kDefaultPasteHotkeyVk = 0;  // 0 = default dual key: Tab or F4.
 
 bool IsModifierVk(DWORD vk) {
@@ -970,6 +4174,33 @@ private:
         HWND info = nullptr;
     };
 
+    struct PtsDialogState {
+        ToolTypeApp* app = nullptr;
+        HWND dialog = nullptr;
+        HWND status = nullptr;
+        HWND percent = nullptr;
+        HWND backupSettings = nullptr;
+        HWND backupFonts = nullptr;
+        HWND backupAll = nullptr;
+        HWND restore = nullptr;
+        HWND close = nullptr;
+        RECT progressRect{18, 226, 462, 246};
+        int progress = 0;
+        ULONGLONG lastProgressPaint = 0;
+        std::wstring lastProgressMessage;
+        bool busy = false;
+    };
+
+    struct ChoiceDialogState {
+        ToolTypeApp* app = nullptr;
+        std::wstring title;
+        std::wstring prompt;
+        std::vector<std::wstring> options;
+        HWND list = nullptr;
+        int selectedIndex = 0;
+        bool accepted = false;
+    };
+
     static LRESULT CALLBACK InputDialogWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         auto* state = reinterpret_cast<InputDialogState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
         if (msg == WM_NCCREATE) {
@@ -1078,6 +4309,141 @@ private:
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
 
+    static LRESULT CALLBACK PtsDialogWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+        auto* state = reinterpret_cast<PtsDialogState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (msg == WM_NCCREATE) {
+            auto* cs = reinterpret_cast<CREATESTRUCTW*>(lp);
+            state = reinterpret_cast<PtsDialogState*>(cs->lpCreateParams);
+            state->dialog = hwnd;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+        }
+
+        switch (msg) {
+            case WM_ERASEBKGND:
+                if (state && state->app) {
+                    state->app->FillDialogBackground(hwnd, reinterpret_cast<HDC>(wp));
+                    return 1;
+                }
+                break;
+            case WM_PAINT:
+                if (state && state->app) {
+                    state->app->PaintPtsDialogFrame(hwnd, state);
+                    return 0;
+                }
+                break;
+            case WM_CTLCOLORSTATIC:
+                if (state && state->app) {
+                    SetTextColor(reinterpret_cast<HDC>(wp), kTextColor);
+                    SetBkMode(reinterpret_cast<HDC>(wp), TRANSPARENT);
+                    return reinterpret_cast<LRESULT>(state->app->backBrush_);
+                }
+                break;
+            case WM_DRAWITEM:
+                if (state && state->app) {
+                    state->app->DrawDialogButton(reinterpret_cast<DRAWITEMSTRUCT*>(lp));
+                    return TRUE;
+                }
+                break;
+            case WM_COMMAND:
+                if (state && state->app) {
+                    state->app->HandlePtsDialogCommand(state, LOWORD(wp));
+                    return 0;
+                }
+                break;
+            case WM_KEYDOWN:
+                if (wp == VK_ESCAPE && state && !state->busy) {
+                    DestroyWindow(hwnd);
+                    return 0;
+                }
+                break;
+            case WM_CLOSE:
+                if (state && state->busy) {
+                    state->app->UpdatePtsProgress(state, state->progress,
+                                                  L"Đang xử lý, vui lòng chờ hoàn tất...");
+                    return 0;
+                }
+                DestroyWindow(hwnd);
+                return 0;
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+
+
+    static LRESULT CALLBACK ChoiceDialogWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+        auto* state = reinterpret_cast<ChoiceDialogState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (msg == WM_NCCREATE) {
+            auto* cs = reinterpret_cast<CREATESTRUCTW*>(lp);
+            state = reinterpret_cast<ChoiceDialogState*>(cs->lpCreateParams);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+        }
+
+        switch (msg) {
+            case WM_ERASEBKGND:
+                if (state && state->app) {
+                    state->app->FillDialogBackground(hwnd, reinterpret_cast<HDC>(wp));
+                    return 1;
+                }
+                break;
+            case WM_PAINT:
+                if (state && state->app) {
+                    state->app->PaintDialogFrame(hwnd);
+                    return 0;
+                }
+                break;
+            case WM_CTLCOLORSTATIC:
+                if (state && state->app) {
+                    SetTextColor(reinterpret_cast<HDC>(wp), kTextColor);
+                    SetBkMode(reinterpret_cast<HDC>(wp), TRANSPARENT);
+                    return reinterpret_cast<LRESULT>(state->app->backBrush_);
+                }
+                break;
+            case WM_CTLCOLORLISTBOX:
+                if (state && state->app) {
+                    SetTextColor(reinterpret_cast<HDC>(wp), kTextColor);
+                    SetBkColor(reinterpret_cast<HDC>(wp), kPanelColor);
+                    return reinterpret_cast<LRESULT>(state->app->panelBrush_);
+                }
+                break;
+            case WM_DRAWITEM:
+                if (state && state->app) {
+                    state->app->DrawDialogButton(reinterpret_cast<DRAWITEMSTRUCT*>(lp));
+                    return TRUE;
+                }
+                break;
+            case WM_COMMAND:
+                if (!state) break;
+                if (LOWORD(wp) == IDOK && state->list) {
+                    LRESULT sel = SendMessageW(state->list, LB_GETCURSEL, 0, 0);
+                    state->selectedIndex = sel == LB_ERR ? 0 : static_cast<int>(sel);
+                    state->accepted = true;
+                    DestroyWindow(hwnd);
+                    return 0;
+                }
+                if (LOWORD(wp) == IDCANCEL) {
+                    DestroyWindow(hwnd);
+                    return 0;
+                }
+                if (reinterpret_cast<HWND>(lp) == state->list && HIWORD(wp) == LBN_DBLCLK) {
+                    LRESULT sel = SendMessageW(state->list, LB_GETCURSEL, 0, 0);
+                    state->selectedIndex = sel == LB_ERR ? 0 : static_cast<int>(sel);
+                    state->accepted = true;
+                    DestroyWindow(hwnd);
+                    return 0;
+                }
+                break;
+            case WM_KEYDOWN:
+                if (wp == VK_ESCAPE) {
+                    DestroyWindow(hwnd);
+                    return 0;
+                }
+                break;
+            case WM_CLOSE:
+                DestroyWindow(hwnd);
+                return 0;
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+
     static LRESULT CALLBACK ButtonWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         auto* app = reinterpret_cast<ToolTypeApp*>(GetWindowLongPtrW(GetParent(hwnd), GWLP_USERDATA));
         if (app) {
@@ -1170,9 +4536,11 @@ private:
         googleDocsButton_ = CreateButton(L"GDocs", ID_GDOCS);
         hotkeyButton_ = CreateButton(L"Tab/F4", ID_HOTKEY);
         guideButton_ = CreateButton(L"Guide", ID_GUIDE);
+        ptsButton_ = CreateButton(L"Pts", ID_PTS);
         ShowWindow(googleDocsButton_, SW_HIDE);
         ShowWindow(hotkeyButton_, SW_HIDE);
         ShowWindow(guideButton_, SW_HIDE);
+        ShowWindow(ptsButton_, SW_HIDE);
 
         status_ = CreateWindowExW(0, L"STATIC", kLatestVersionMessage,
                                   WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOTIFY, 0, 0, 0, 0,
@@ -1227,8 +4595,8 @@ private:
         for (int i = 0; i < 6; ++i) {
             MoveWindow(buttons[i], buttonX, top + i * (buttonH + gap), buttonW, buttonH, TRUE);
         }
-        HWND extraButtons[] = {googleDocsButton_, hotkeyButton_, guideButton_};
-        for (int i = 0; i < 3; ++i) {
+        HWND extraButtons[] = {googleDocsButton_, hotkeyButton_, guideButton_, ptsButton_};
+        for (int i = 0; i < 4; ++i) {
             ShowWindow(extraButtons[i], expanded_ ? SW_SHOW : SW_HIDE);
             MoveWindow(extraButtons[i], secondButtonX, top + i * (buttonH + gap), buttonW, buttonH, TRUE);
         }
@@ -1285,6 +4653,9 @@ private:
         } else if (id == ID_EXPAND) {
             fill = expanded_ ? RGB(0, 50, 84) : RGB(18, 18, 18);
             border = expanded_ ? RGB(75, 180, 255) : RGB(112, 120, 122);
+        } else if (id == ID_PTS) {
+            fill = RGB(45, 27, 74);
+            border = RGB(184, 134, 255);
         }
 
         if (hot) {
@@ -1331,6 +4702,34 @@ private:
         SelectObject(hdc, oldBrush);
         SelectObject(hdc, oldPen);
         DeleteObject(pen);
+
+        EndPaint(hwnd, &ps);
+    }
+
+    void PaintPtsDialogFrame(HWND hwnd, const PtsDialogState* state) {
+        PAINTSTRUCT ps{};
+        HDC hdc = BeginPaint(hwnd, &ps);
+        FillDialogBackground(hwnd, hdc);
+
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        HPEN pen = CreatePen(PS_SOLID, 1, kBorderColor);
+        HGDIOBJ oldPen = SelectObject(hdc, pen);
+        HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
+        SelectObject(hdc, oldBrush);
+        SelectObject(hdc, oldPen);
+        DeleteObject(pen);
+
+        RECT bar = state ? state->progressRect : RECT{18, 218, 462, 238};
+        FillSolidRect(hdc, bar, RGB(22, 22, 22));
+        DrawCrispOnePixelBorder(hdc, bar, kBorderColor);
+        int pct = state ? std::clamp(state->progress, 0, 100) : 0;
+        RECT fill = bar;
+        fill.right = fill.left + MulDiv(RectWidth(bar), pct, 100);
+        if (fill.right > fill.left) {
+            FillSolidRect(hdc, fill, RGB(0, 135, 95));
+        }
 
         EndPaint(hwnd, &ps);
     }
@@ -1818,6 +5217,7 @@ private:
             case ID_GDOCS: return googleDocsButton_;
             case ID_HOTKEY: return hotkeyButton_;
             case ID_GUIDE: return guideButton_;
+            case ID_PTS: return ptsButton_;
         }
         return nullptr;
     }
@@ -1868,6 +5268,9 @@ private:
                 break;
             case ID_GUIDE:
                 ShowGuidePopup();
+                break;
+            case ID_PTS:
+                ShowPtsPopup();
                 break;
         }
     }
@@ -2586,9 +5989,523 @@ private:
             L"6. Khi bật, nhấn " + HotkeyLabel() + L" ở cửa sổ khác để dán dòng đang chọn rồi tự nhảy dòng.\n"
             L"7. Dòng trống và dòng bắt đầu bằng // vẫn hiển thị nhưng sẽ bị bỏ qua khi dán.\n"
             L"8. Dòng bắt đầu bằng *, -, > sẽ được bỏ ký tự đánh dấu và chuẩn hóa khoảng trắng khi dán.\n"
-            L"9. Save/Open lưu và mở lại vị trí file hiện tại.";
+            L"9. Save/Open lưu và mở lại vị trí file hiện tại.\n"
+            L"10. Pts: sao lưu/khôi phục Photoshop settings và font custom bằng file .afang.";
         MessageBoxW(hwnd_, guide.c_str(), L"Hướng dẫn ToolType",
                     MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND);
+        SetEnabled(wasEnabled, false);
+    }
+
+    void PumpPtsDialogMessages(HWND dialog) {
+        MSG msg{};
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                PostQuitMessage(static_cast<int>(msg.wParam));
+                break;
+            }
+            if (!dialog || !IsWindow(dialog) || !IsDialogMessageW(dialog, &msg)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+
+    void UpdatePtsProgress(PtsDialogState* state, int percent, const std::wstring& message) {
+        if (!state || !state->dialog) return;
+        int nextProgress = std::clamp(percent, 0, 100);
+        ULONGLONG now = GetTickCount64();
+        bool terminal = nextProgress == 0 || nextProgress == 100;
+        bool changedPercent = nextProgress != state->progress;
+        bool dueForPaint = terminal || changedPercent ||
+                           now - state->lastProgressPaint >= 75;
+        state->progress = nextProgress;
+        if (!dueForPaint) return;
+
+        std::wstring compactMessage = CompactPtsNotice(message);
+        state->lastProgressPaint = now;
+        state->lastProgressMessage = compactMessage;
+        if (state->status) SetWindowTextW(state->status, compactMessage.c_str());
+        if (state->percent) {
+            std::wstring pct = std::to_wstring(state->progress) + L"%";
+            SetWindowTextW(state->percent, pct.c_str());
+        }
+        InvalidateRect(state->dialog, &state->progressRect, TRUE);
+        UpdateWindow(state->dialog);
+        if (state->status) UpdateWindow(state->status);
+        if (state->percent) UpdateWindow(state->percent);
+        PumpPtsDialogMessages(state->dialog);
+    }
+
+    void SetPtsDialogBusy(PtsDialogState* state, bool busy) {
+        if (!state) return;
+        state->busy = busy;
+        for (HWND button : {state->backupSettings, state->backupFonts, state->backupAll,
+                            state->restore, state->close}) {
+            if (button) EnableWindow(button, busy ? FALSE : TRUE);
+        }
+    }
+
+    std::wstring EnsureAfangExtension(std::wstring path) const {
+        if (ExtensionLower(path) != L".afang") path += L".afang";
+        return path;
+    }
+
+    bool PromptForAfangSave(HWND owner, const wchar_t* title, const wchar_t* defaultName,
+                            std::wstring& path) {
+        wchar_t buffer[MAX_PATH] = {};
+        std::wcsncpy(buffer, defaultName, MAX_PATH - 1);
+        OPENFILENAMEW ofn{};
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = owner ? owner : hwnd_;
+        ofn.lpstrFilter = L"Afang backup (*.afang)\0*.afang\0All files (*.*)\0*.*\0";
+        ofn.lpstrFile = buffer;
+        ofn.nMaxFile = MAX_PATH;
+        ofn.lpstrTitle = title;
+        ofn.lpstrDefExt = L"afang";
+        ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+        if (!GetSaveFileNameW(&ofn)) return false;
+        path = EnsureAfangExtension(buffer);
+        return true;
+    }
+
+    bool PromptForAfangOpen(HWND owner, std::wstring& path) {
+        wchar_t buffer[MAX_PATH] = {};
+        OPENFILENAMEW ofn{};
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = owner ? owner : hwnd_;
+        ofn.lpstrFilter = L"Afang backup (*.afang)\0*.afang\0All files (*.*)\0*.*\0";
+        ofn.lpstrFile = buffer;
+        ofn.nMaxFile = MAX_PATH;
+        ofn.lpstrTitle = L"Khôi phục backup .afang";
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+        if (!GetOpenFileNameW(&ofn)) return false;
+        path = buffer;
+        return true;
+    }
+
+    bool PromptForChoice(HWND owner, const wchar_t* title, const wchar_t* prompt,
+                         const std::vector<std::wstring>& options, int& selectedIndex) {
+        if (options.empty()) return false;
+        if (options.size() == 1) {
+            selectedIndex = 0;
+            return true;
+        }
+
+        WNDCLASSW wc{};
+        if (!GetClassInfoW(instance_, L"ToolTypeChoiceDialog", &wc)) {
+            wc.lpfnWndProc = &ToolTypeApp::ChoiceDialogWndProc;
+            wc.hInstance = instance_;
+            wc.lpszClassName = L"ToolTypeChoiceDialog";
+            wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+            wc.hbrBackground = nullptr;
+            if (!RegisterClassW(&wc)) return false;
+        }
+
+        HWND parent = owner ? owner : hwnd_;
+        ChoiceDialogState state{};
+        state.app = this;
+        state.title = title ? title : L"ToolType";
+        state.prompt = prompt ? prompt : L"Chọn một mục:";
+        state.options = options;
+        state.selectedIndex = std::clamp(selectedIndex, 0, static_cast<int>(options.size()) - 1);
+
+        RECT ownerRc{};
+        GetWindowRect(parent, &ownerRc);
+        int width = 520;
+        int listHeight = std::clamp(32 + static_cast<int>(options.size()) * 22, 96, 220);
+        int height = listHeight + 126;
+        int x = ownerRc.left + (RectWidth(ownerRc) - width) / 2;
+        int y = ownerRc.top + (RectHeight(ownerRc) - height) / 2;
+        DWORD exStyle = WS_EX_TOOLWINDOW | WS_EX_LAYERED | (topMost_ ? WS_EX_TOPMOST : 0);
+        HWND dialog = CreateWindowExW(exStyle, L"ToolTypeChoiceDialog", state.title.c_str(),
+                                      WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_BORDER,
+                                      x, y, width, height, parent, nullptr, instance_, &state);
+        if (!dialog) return false;
+        SetLayeredWindowAttributes(dialog, 0, kWindowAlpha, LWA_ALPHA);
+
+        HWND labelWnd = CreateWindowExW(0, L"STATIC", state.prompt.c_str(),
+                                        WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                        14, 14, width - 28, 24, dialog, nullptr, instance_, nullptr);
+        state.list = CreateWindowExW(0, L"LISTBOX", nullptr,
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER |
+                                         WS_VSCROLL | LBS_NOTIFY,
+                                     14, 42, width - 28, listHeight,
+                                     dialog, nullptr, instance_, nullptr);
+        for (const auto& option : options) {
+            SendMessageW(state.list, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(option.c_str()));
+        }
+        SendMessageW(state.list, LB_SETCURSEL, static_cast<WPARAM>(state.selectedIndex), 0);
+
+        int buttonY = 54 + listHeight;
+        HWND ok = CreateWindowExW(0, L"BUTTON", L"OK",
+                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW | BS_DEFPUSHBUTTON,
+                                  width - 206, buttonY, 84, 30, dialog, reinterpret_cast<HMENU>(IDOK),
+                                  instance_, nullptr);
+        HWND cancel = CreateWindowExW(0, L"BUTTON", L"Hủy",
+                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                      width - 110, buttonY, 84, 30, dialog,
+                                      reinterpret_cast<HMENU>(IDCANCEL), instance_, nullptr);
+        for (HWND control : {labelWnd, state.list, ok, cancel}) {
+            SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+        }
+
+        EnableWindow(parent, FALSE);
+        ShowWindow(dialog, SW_SHOW);
+        SetFocus(state.list);
+
+        MSG msg{};
+        while (IsWindow(dialog) && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+            if (!IsDialogMessageW(dialog, &msg)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+
+        EnableWindow(parent, TRUE);
+        SetForegroundWindow(parent);
+        if (state.accepted) selectedIndex = state.selectedIndex;
+        return state.accepted;
+    }
+
+    void ApplyBackupVersionSelection(const PtsPhotoshopVersion& version,
+                                     PtsBackupOptions& options) const {
+        options.selectedPhotoshopVersionLabel = version.label;
+        options.selectedPhotoshopVersionKeys.clear();
+        options.selectedPhotoshopVersionLabels.clear();
+        if (!version.label.empty()) {
+            options.selectedPhotoshopVersionLabels.insert(LowerWide(version.label));
+        }
+        for (const auto& root : version.roots) {
+            options.selectedPhotoshopVersionKeys.insert(root.versionKey);
+        }
+    }
+
+    void ApplyRestoreTargetVersion(const PtsPhotoshopVersion& version,
+                                   PtsRestoreOptions& options) const {
+        options.targetVersionLabel = version.label;
+        options.targetAppDataRelativeRoot = RootForToken(version, L"APPDATA");
+        options.targetLocalAppDataRelativeRoot = RootForToken(version, L"LOCALAPPDATA");
+        if (options.targetAppDataRelativeRoot.empty()) {
+            options.targetAppDataRelativeRoot = DefaultPhotoshopRelativeRootForLabel(version.label);
+        }
+        if (options.targetLocalAppDataRelativeRoot.empty()) {
+            options.targetLocalAppDataRelativeRoot = DefaultPhotoshopRelativeRootForLabel(version.label);
+        }
+    }
+
+    std::wstring PhotoshopVersionChoiceLabel(const std::wstring& label, size_t) const {
+        return label;
+    }
+
+    bool PrepareBackupOptions(HWND owner, bool includeSettings, PtsBackupOptions& options) {
+        options = PtsBackupOptions{};
+        if (!includeSettings) return true;
+
+        std::vector<PtsPhotoshopVersion> versions = DiscoverPhotoshopVersions();
+        if (versions.empty()) return true;
+        if (versions.size() == 1) {
+            ApplyBackupVersionSelection(versions.front(), options);
+            return true;
+        }
+
+        std::vector<std::wstring> choices;
+        for (const auto& version : versions) {
+            choices.push_back(PhotoshopVersionChoiceLabel(version.label, version.roots.size()));
+        }
+
+        int selected = 0;
+        if (!PromptForChoice(owner, L"Chọn phiên bản Photoshop",
+                             L"Máy có nhiều phiên bản Photoshop. Chọn phiên bản muốn sao lưu:",
+                             choices, selected)) {
+            return false;
+        }
+        ApplyBackupVersionSelection(versions[static_cast<size_t>(selected)], options);
+        return true;
+    }
+
+    bool PrepareRestoreOptions(HWND owner, const std::wstring& path, PtsRestoreOptions& options,
+                               std::wstring& error,
+                               const PtsProgressCallback& progress = {}) {
+        options = PtsRestoreOptions{};
+        error.clear();
+
+        PtsArchiveScanResult scan{};
+        if (!InspectPtsArchiveVersions(path, scan, error, progress)) return false;
+        options.archiveHasSettings = scan.hasSettings;
+        options.archiveValidated = true;
+        if (!scan.hasSettings) return true;
+        if (scan.versions.empty()) {
+            error = L"File .afang không có thông tin phiên bản Photoshop để khôi phục settings.";
+            return false;
+        }
+
+        std::sort(scan.versions.begin(), scan.versions.end(),
+                  [](const PtsArchiveVersion& a, const PtsArchiveVersion& b) {
+                      return LowerWide(a.label) < LowerWide(b.label);
+                  });
+
+        if (scan.versions.size() > 1) {
+            std::vector<std::wstring> choices;
+            for (const auto& version : scan.versions) {
+                choices.push_back(PhotoshopVersionChoiceLabel(version.label, version.rootKeys.size()));
+            }
+            int selected = 0;
+            if (!PromptForChoice(owner, L"Chọn phiên bản trong .afang",
+                                 L"File sao lưu có nhiều phiên bản Photoshop. Chọn phiên bản settings muốn khôi phục:",
+                                 choices, selected)) {
+                return false;
+            }
+            const auto& source = scan.versions[static_cast<size_t>(selected)];
+            options.sourceVersionLabel = source.label;
+            options.sourceVersionKeys = source.rootKeys;
+        } else {
+            options.sourceVersionLabel = scan.versions.front().label;
+        }
+
+        std::vector<PtsPhotoshopVersion> installed = DiscoverPhotoshopVersions();
+        if (installed.size() > 1) {
+            std::vector<std::wstring> choices;
+            for (const auto& version : installed) {
+                choices.push_back(PhotoshopVersionChoiceLabel(version.label, version.roots.size()));
+            }
+            int selected = 0;
+            if (!PromptForChoice(owner, L"Chọn Photoshop đích",
+                                 L"Máy có nhiều phiên bản Photoshop. Chọn phiên bản trên máy để khôi phục vào:",
+                                 choices, selected)) {
+                return false;
+            }
+            ApplyRestoreTargetVersion(installed[static_cast<size_t>(selected)], options);
+        } else if (installed.size() == 1) {
+            ApplyRestoreTargetVersion(installed.front(), options);
+        }
+        return true;
+    }
+
+    void RunPtsBackup(PtsDialogState* state, bool includeSettings, bool includeFonts,
+                      const wchar_t* defaultName) {
+        PtsBackupOptions options;
+        if (!PrepareBackupOptions(state ? state->dialog : hwnd_, includeSettings, options)) {
+            UpdatePtsProgress(state, state ? state->progress : 0, L"Đã hủy chọn phiên bản Photoshop.");
+            return;
+        }
+
+        std::wstring path;
+        if (!PromptForAfangSave(state ? state->dialog : hwnd_, L"Lưu backup .afang", defaultName, path)) {
+            UpdatePtsProgress(state, state ? state->progress : 0, L"Đã hủy chọn file backup.");
+            return;
+        }
+
+        SetPtsDialogBusy(state, true);
+        UpdatePtsProgress(state, 0, L"Bắt đầu backup, vui lòng chờ...");
+        std::wstring summary;
+        std::wstring error;
+        auto progress = [this, state](int percent, const std::wstring& message) {
+            UpdatePtsProgress(state, percent, message);
+        };
+        bool ok = CreatePtsBackupArchive(path, includeSettings, includeFonts, options,
+                                         progress, summary, error);
+        SetPtsDialogBusy(state, false);
+
+        if (ok) {
+            summary = CompactPtsNotice(summary);
+            UpdatePtsProgress(state, 100, summary);
+            SetStatus(L"Pts: đã tạo backup .afang.");
+            MessageBoxW(state->dialog, summary.c_str(), L"Pts backup",
+                        MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND |
+                            (topMost_ ? MB_TOPMOST : 0));
+        } else {
+            error = CompactPtsNotice(error);
+            UpdatePtsProgress(state, 0, error);
+            SetStatus(L"Pts: backup thất bại.");
+            MessageBoxW(state->dialog, error.c_str(), L"Pts backup",
+                        MB_OK | MB_ICONERROR | MB_SETFOREGROUND |
+                            (topMost_ ? MB_TOPMOST : 0));
+        }
+    }
+
+    void RunPtsRestore(PtsDialogState* state) {
+        std::wstring path;
+        if (!PromptForAfangOpen(state ? state->dialog : hwnd_, path)) {
+            UpdatePtsProgress(state, state ? state->progress : 0, L"Đã hủy chọn file restore.");
+            return;
+        }
+
+        PtsRestoreOptions options;
+        std::wstring prepareError;
+        SetPtsDialogBusy(state, true);
+        auto progress = [this, state](int percent, const std::wstring& message) {
+            UpdatePtsProgress(state, percent, message);
+        };
+        UpdatePtsProgress(state, state ? state->progress : 0, L"Đang kiểm tra file .afang...");
+        if (!PrepareRestoreOptions(state ? state->dialog : hwnd_, path, options, prepareError,
+                                   progress)) {
+            SetPtsDialogBusy(state, false);
+            if (prepareError.empty()) {
+                UpdatePtsProgress(state, state ? state->progress : 0, L"Đã hủy chọn phiên bản khôi phục.");
+            } else {
+                prepareError = CompactPtsNotice(prepareError);
+                UpdatePtsProgress(state, 0, prepareError);
+                MessageBoxW(state->dialog, prepareError.c_str(), L"Pts restore",
+                            MB_OK | MB_ICONERROR | MB_SETFOREGROUND |
+                                (topMost_ ? MB_TOPMOST : 0));
+            }
+            return;
+        }
+
+        if (options.archiveHasSettings && IsPhotoshopRunning()) {
+            std::wstring error = L"Photoshop đang chạy. Hãy đóng Photoshop trước khi restore "
+                                 L"để layout, preferences và tool state không bị ghi đè "
+                                 L"khi Photoshop thoát.";
+            error = CompactPtsNotice(error);
+            UpdatePtsProgress(state, 0, error);
+            MessageBoxW(state->dialog, error.c_str(), L"Pts restore",
+                        MB_OK | MB_ICONWARNING | MB_SETFOREGROUND |
+                             (topMost_ ? MB_TOPMOST : 0));
+            SetPtsDialogBusy(state, false);
+            return;
+        }
+
+        UpdatePtsProgress(state, 0, L"Bắt đầu restore .afang...");
+        std::wstring summary;
+        std::wstring error;
+        bool ok = RestorePtsBackupArchive(path, options, progress, summary, error);
+        SetPtsDialogBusy(state, false);
+
+        if (ok) {
+            summary = CompactPtsNotice(summary);
+            UpdatePtsProgress(state, 100, summary);
+            SetStatus(L"Pts: restore hoàn tất.");
+            MessageBoxW(state->dialog, summary.c_str(), L"Pts restore",
+                        MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND |
+                            (topMost_ ? MB_TOPMOST : 0));
+        } else {
+            error = CompactPtsNotice(error);
+            UpdatePtsProgress(state, 0, error);
+            SetStatus(L"Pts: restore thất bại.");
+            MessageBoxW(state->dialog, error.c_str(), L"Pts restore",
+                        MB_OK | MB_ICONERROR | MB_SETFOREGROUND |
+                            (topMost_ ? MB_TOPMOST : 0));
+        }
+    }
+
+    void HandlePtsDialogCommand(PtsDialogState* state, int id) {
+        if (!state || state->busy) return;
+        switch (id) {
+            case ID_PTS_BACKUP_SETTINGS:
+                RunPtsBackup(state, true, false, L"photoshop-settings.afang");
+                break;
+            case ID_PTS_BACKUP_FONTS:
+                RunPtsBackup(state, false, true, L"photoshop-fonts.afang");
+                break;
+            case ID_PTS_BACKUP_ALL:
+                RunPtsBackup(state, true, true, L"photoshop-all.afang");
+                break;
+            case ID_PTS_RESTORE:
+                RunPtsRestore(state);
+                break;
+            case IDCANCEL:
+                DestroyWindow(state->dialog);
+                break;
+        }
+    }
+
+    HWND CreatePtsDialogButton(HWND dialog, const wchar_t* text, int id, int x, int y, int w, int h) {
+        HWND button = CreateWindowExW(0, L"BUTTON", text,
+                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                      x, y, w, h, dialog, reinterpret_cast<HMENU>(id),
+                                      instance_, nullptr);
+        SendMessageW(button, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+        return button;
+    }
+
+    void ShowPtsPopup() {
+        WNDCLASSW wc{};
+        if (!GetClassInfoW(instance_, L"ToolTypePtsDialog", &wc)) {
+            wc.lpfnWndProc = &ToolTypeApp::PtsDialogWndProc;
+            wc.hInstance = instance_;
+            wc.lpszClassName = L"ToolTypePtsDialog";
+            wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+            wc.hbrBackground = nullptr;
+            if (!RegisterClassW(&wc)) return;
+        }
+
+        bool wasEnabled = enabled_;
+        SetEnabled(false, false);
+
+        PtsDialogState state{};
+        state.app = this;
+
+        DWORD exStyle = WS_EX_TOOLWINDOW | WS_EX_LAYERED | (topMost_ ? WS_EX_TOPMOST : 0);
+        DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_BORDER;
+        RECT desiredClient{0, 0, 500, 280};
+        AdjustWindowRectEx(&desiredClient, style, FALSE, exStyle);
+        int width = RectWidth(desiredClient);
+        int height = RectHeight(desiredClient);
+
+        RECT owner{};
+        GetWindowRect(hwnd_, &owner);
+        int x = owner.left + (RectWidth(owner) - width) / 2;
+        int y = owner.top + (RectHeight(owner) - height) / 2;
+        HWND dialog = CreateWindowExW(exStyle, L"ToolTypePtsDialog", L"Pts - Photoshop tools",
+                                      style,
+                                      x, y, width, height, hwnd_, nullptr, instance_, &state);
+        if (!dialog) {
+            SetEnabled(wasEnabled, false);
+            return;
+        }
+        SetLayeredWindowAttributes(dialog, 0, kWindowAlpha, LWA_ALPHA);
+
+        RECT client{};
+        GetClientRect(dialog, &client);
+        int clientW = std::max(500, RectWidth(client));
+        int rightButtonX = clientW - 248;
+        int contentRight = clientW - 38;
+        int closeW = 80;
+        int closeH = 30;
+        int closeX = clientW - 118;
+        int closeY = std::max(202, RectHeight(client) - 18 - closeH);
+        state.progressRect = {18, closeY - 56, contentRight, closeY - 36};
+        int percentW = 64;
+        int percentX = contentRight - percentW;
+        int statusW = std::max(260, percentX - 24);
+
+        HWND title = CreateWindowExW(0, L"STATIC", L"Backup / Restore Photoshop",
+                                    WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                    18, 16, clientW - 56, 22, dialog, nullptr, instance_, nullptr);
+        state.backupSettings = CreatePtsDialogButton(dialog, L"Backup PS Settings",
+                                                     ID_PTS_BACKUP_SETTINGS, 18, 58, 210, 34);
+        state.backupFonts = CreatePtsDialogButton(dialog, L"Backup Fonts",
+                                                  ID_PTS_BACKUP_FONTS, rightButtonX, 58, 210, 34);
+        state.backupAll = CreatePtsDialogButton(dialog, L"Backup Settings + Fonts",
+                                                ID_PTS_BACKUP_ALL, 18, 102, 210, 34);
+        state.restore = CreatePtsDialogButton(dialog, L"Restore",
+                                              ID_PTS_RESTORE, rightButtonX, 102, 210, 34);
+        state.status = CreateWindowExW(0, L"STATIC", L"Sẵn sàng. Chọn thao tác để bắt đầu.",
+                                       WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                       18, 140, statusW, 32, dialog, nullptr, instance_, nullptr);
+        state.percent = CreateWindowExW(0, L"STATIC", L"0%",
+                                        WS_CHILD | WS_VISIBLE | SS_RIGHT,
+                                        percentX, 148, percentW, 22, dialog, nullptr, instance_, nullptr);
+        state.close = CreatePtsDialogButton(dialog, L"Đóng", IDCANCEL, closeX, closeY, closeW, closeH);
+
+        for (HWND control : {title, state.status, state.percent}) {
+            SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+        }
+
+        EnableWindow(hwnd_, FALSE);
+        ShowWindow(dialog, SW_SHOW);
+        SetForegroundWindow(dialog);
+
+        MSG msg{};
+        while (IsWindow(dialog) && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+            if (!IsDialogMessageW(dialog, &msg)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+
+        EnableWindow(hwnd_, TRUE);
+        SetForegroundWindow(hwnd_);
         SetEnabled(wasEnabled, false);
     }
 
@@ -2671,6 +6588,7 @@ private:
     HWND googleDocsButton_ = nullptr;
     HWND hotkeyButton_ = nullptr;
     HWND guideButton_ = nullptr;
+    HWND ptsButton_ = nullptr;
     HWND status_ = nullptr;
     HWND tooltip_ = nullptr;
     HFONT font_ = nullptr;

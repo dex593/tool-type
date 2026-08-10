@@ -78,6 +78,7 @@ Write-Host "Runtime link flags: $($runtimeLinkFlags -join ' ')"
     "-Wl,--nxcompat" `
     $libraryLinkFlags `
     -lcomdlg32 `
+    -ladvapi32 `
     -lgdi32 `
     -lshell32 `
     -luser32 `
