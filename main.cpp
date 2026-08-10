@@ -2168,6 +2168,10 @@ int ScalePtsMetric(int value, UINT dpi) {
     return MulDiv(value, static_cast<int>(dpi == 0 ? 96 : dpi), 96);
 }
 
+int PtsDialogFontHeight(UINT dpi) {
+    return -ScalePtsMetric(13, dpi);
+}
+
 struct PtsDialogLayout {
     int clientWidth = 0;
     int clientHeight = 0;
@@ -2213,6 +2217,16 @@ UINT QueryPtsDialogDpi(HWND owner) {
     int dpi = GetDeviceCaps(dc, LOGPIXELSX);
     ReleaseDC(owner, dc);
     return dpi > 0 ? static_cast<UINT>(dpi) : 96;
+}
+
+HFONT CreatePtsDialogFont(HFONT baseFont, UINT dpi) {
+    LOGFONTW font{};
+    if (!baseFont || GetObjectW(baseFont, sizeof(font), &font) != sizeof(font)) {
+        font.lfCharSet = DEFAULT_CHARSET;
+        std::wcscpy(font.lfFaceName, L"Segoe UI");
+    }
+    font.lfHeight = PtsDialogFontHeight(dpi);
+    return CreateFontIndirectW(&font);
 }
 
 std::wstring FormatBytes(uint64_t bytes) {
@@ -4265,13 +4279,13 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
     uint32_t workspaceCompatibilityConversions = 0;
     uint32_t registrySettingsPathUpdates = 0;
     uint64_t restoredBytes = 0;
-    bool wroteAnyDestination = false;
+    bool appliedAnyChange = false;
     std::set<std::wstring> restoredSettingsRoots;
     std::set<std::wstring> targetSettingsFoldersForRegistry;
     std::vector<RestoredUserFont> fontsToRegister;
     auto cancellationError = [&] {
-        return restored > 0 || wroteAnyDestination
-                   ? L"Đã hủy khôi phục giữa chừng. Một phần thay đổi đã được áp dụng và không tự hoàn tác."
+        return appliedAnyChange
+                   ? L"Đã hủy khôi phục sau khi áp dụng một phần. Các thay đổi không tự hoàn tác."
                    : L"Đã hủy khôi phục; chưa có thay đổi nào được áp dụng.";
     };
 
@@ -4386,7 +4400,7 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
                     error = L"Không ghi được font " + FileNameOnly(destination) + L".\n" + error;
                     return false;
                 }
-                wroteAnyDestination = true;
+                appliedAnyChange = true;
                 ++fontFilesWritten;
                 restoredBytes += raw.size();
             }
@@ -4493,7 +4507,7 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
                 CloseHandle(file);
                 return false;
             }
-            wroteAnyDestination = true;
+            appliedAnyChange = true;
             if (pathIndex > 0) ++settingsCompatibilityAliases;
 
             if (options.HasTargetMapping() && rootToken == L"APPDATA") {
@@ -4535,6 +4549,10 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
     if (!fontsToRegister.empty()) {
         progress(95, L"Đang đăng ký font cho người dùng hiện tại...");
         fontRegistration = RegisterRestoredUserFonts(fontsToRegister, progress, cancelled);
+        if (fontRegistration.resourceRegistrations > 0 ||
+            fontRegistration.registryUpdates > 0) {
+            appliedAnyChange = true;
+        }
         if (cancellationRequested()) {
             error = cancellationError();
             return false;
@@ -4558,9 +4576,10 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
         registrySettingsPathUpdates = registryUpdater
                                           ? registryUpdater(options.targetVersionLabel,
                                                             targetSettingsFoldersForRegistry)
-                                          : UpdatePhotoshopSettingsFilePathRegistry(
-                                                options.targetVersionLabel,
-                                                targetSettingsFoldersForRegistry);
+                                           : UpdatePhotoshopSettingsFilePathRegistry(
+                                                 options.targetVersionLabel,
+                                                 targetSettingsFoldersForRegistry);
+        if (registrySettingsPathUpdates > 0) appliedAnyChange = true;
     }
 
     if (cancellationRequested()) {
@@ -5533,7 +5552,9 @@ private:
         if (pressed) OffsetRect(&textRc, 1, 1);
         SetBkMode(di->hDC, TRANSPARENT);
         SetTextColor(di->hDC, textColor);
-        SelectObject(di->hDC, font_);
+        HFONT controlFont = reinterpret_cast<HFONT>(
+            SendMessageW(di->hwndItem, WM_GETFONT, 0, 0));
+        SelectObject(di->hDC, controlFont ? controlFont : font_);
         DrawTextW(di->hDC, text, -1, &textRc,
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         if (focused && !disabled) {
@@ -7032,6 +7053,8 @@ private:
                                       WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_BORDER,
                                       x, y, width, height, parent, nullptr, instance_, &state);
         if (!dialog) return false;
+        HFONT dialogFont = CreatePtsDialogFont(font_, dpi);
+        HFONT controlFont = dialogFont ? dialogFont : font_;
         HWND labelWnd = CreateWindowExW(0, L"STATIC", state.prompt.c_str(),
                                         WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
                                         scaled(14), scaled(14), width - scaled(28), scaled(40),
@@ -7057,7 +7080,7 @@ private:
                                       width - scaled(110), buttonY, scaled(84), scaled(30), dialog,
                                       reinterpret_cast<HMENU>(IDCANCEL), instance_, nullptr);
         for (HWND control : {labelWnd, state.list, ok, cancel}) {
-            SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+            SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(controlFont), TRUE);
         }
 
         EnableWindow(parent, FALSE);
@@ -7074,12 +7097,14 @@ private:
             }
         }
         if (getMessageResult == 0) {
+            if (IsWindow(dialog)) DestroyWindow(dialog);
             PostQuitMessage(static_cast<int>(msg.wParam));
         }
 
         EnableWindow(parent, TRUE);
         SetForegroundWindow(parent);
         if (state.accepted) selectedIndex = state.selectedIndex;
+        if (dialogFont) DeleteObject(dialogFont);
         return state.accepted;
     }
 
@@ -7415,6 +7440,8 @@ private:
             SetEnabled(wasEnabled, false);
             return;
         }
+        HFONT dialogFont = CreatePtsDialogFont(font_, dpi);
+        HFONT controlFont = dialogFont ? dialogFont : font_;
 
         auto left = [](const RECT& rect) { return static_cast<int>(rect.left); };
         auto top = [](const RECT& rect) { return static_cast<int>(rect.top); };
@@ -7456,8 +7483,10 @@ private:
             dialog, L"Đóng", IDCANCEL, left(layout.close), top(layout.close),
             widthOf(layout.close), heightOf(layout.close));
 
-        for (HWND control : {title, state.status, state.percent}) {
-            SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+        for (HWND control : {title, state.backupSettings, state.backupFonts,
+                             state.backupAll, state.restore, state.status,
+                             state.percent, state.close}) {
+            SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(controlFont), TRUE);
         }
 
         EnableWindow(hwnd_, FALSE);
@@ -7465,6 +7494,7 @@ private:
         SetForegroundWindow(dialog);
 
         RunPtsDialogMessageLoop(dialog);
+        if (dialogFont) DeleteObject(dialogFont);
 
         EnableWindow(hwnd_, TRUE);
         SetForegroundWindow(hwnd_);

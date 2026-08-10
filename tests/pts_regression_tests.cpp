@@ -238,7 +238,7 @@ void TestCompactPtsNoticeMarksOmittedDetails() {
            "Pts compact notice silently omitted remaining details");
 
     std::wstring partialCancellation = CompactPtsNotice(
-        L"Đã hủy khôi phục giữa chừng. Một phần thay đổi đã được áp dụng và không tự hoàn tác.");
+        L"Đã hủy khôi phục sau khi áp dụng một phần. Các thay đổi không tự hoàn tác.");
     Expect(LowerWide(partialCancellation).find(L"không tự hoàn tác") != std::wstring::npos,
            "Pts popup hid the non-rollback warning after a partial restore");
 }
