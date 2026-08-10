@@ -116,3 +116,5 @@ if ($Coverage) {
         Pop-Location
     }
 }
+
+& (Join-Path $PSScriptRoot "run-pts-tests.ps1")
