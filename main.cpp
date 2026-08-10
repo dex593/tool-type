@@ -7114,13 +7114,7 @@ private:
         ShowWindow(dialog, SW_SHOW);
         SetForegroundWindow(dialog);
 
-        MSG msg{};
-        while (IsWindow(dialog) && GetMessageW(&msg, nullptr, 0, 0) > 0) {
-            if (!IsDialogMessageW(dialog, &msg)) {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-        }
+        RunPtsDialogMessageLoop(dialog);
 
         EnableWindow(hwnd_, TRUE);
         SetForegroundWindow(hwnd_);
