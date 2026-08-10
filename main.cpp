@@ -5554,7 +5554,7 @@ private:
         SetTextColor(di->hDC, textColor);
         HFONT controlFont = reinterpret_cast<HFONT>(
             SendMessageW(di->hwndItem, WM_GETFONT, 0, 0));
-        SelectObject(di->hDC, controlFont ? controlFont : font_);
+        HGDIOBJ oldFont = SelectObject(di->hDC, controlFont ? controlFont : font_);
         DrawTextW(di->hDC, text, -1, &textRc,
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         if (focused && !disabled) {
@@ -5562,6 +5562,7 @@ private:
             InflateRect(&focus, -4, -4);
             DrawFocusRect(di->hDC, &focus);
         }
+        SelectObject(di->hDC, oldFont);
     }
 
     enum class ListPart { None, VThumb, VTrack, HThumb, HTrack };
