@@ -14,6 +14,7 @@
 #include <zlib.h>
 
 #include <algorithm>
+#include <atomic>
 #include <functional>
 #include <cstdint>
 #include <cstdio>
@@ -22,6 +23,8 @@
 #include <cwchar>
 #include <cwctype>
 #include <map>
+#include <memory>
+#include <new>
 #include <set>
 #include <string>
 #include <vector>
@@ -59,6 +62,8 @@ constexpr COLORREF kTooltipBackColor = RGB(18, 18, 18);
 constexpr COLORREF kTooltipBorderColor = RGB(255, 255, 255);
 constexpr UINT WM_APP_PASTE_NEXT = WM_APP + 24;
 constexpr UINT WM_APP_UPDATE_CHECK_DONE = WM_APP + 25;
+constexpr UINT WM_APP_PTS_PROGRESS = WM_APP + 26;
+constexpr UINT WM_APP_PTS_OPERATION_DONE = WM_APP + 27;
 
 constexpr const wchar_t* kToolVersion = L"1.0";
 constexpr const wchar_t* kUpdateCheckUrl =
@@ -750,6 +755,124 @@ struct PtsRestoreOptions {
 };
 
 using PtsProgressCallback = std::function<void(int, const std::wstring&)>;
+using PtsCancellationCallback = std::function<bool()>;
+
+struct PtsCancellationState {
+    std::atomic_bool requested{false};
+};
+
+using PtsCancellationHandle = std::shared_ptr<PtsCancellationState>;
+
+PtsCancellationHandle CreatePtsCancellationHandle() {
+    return std::make_shared<PtsCancellationState>();
+}
+
+void RequestPtsCancellation(const PtsCancellationHandle& cancellation) {
+    if (cancellation) cancellation->requested.store(true, std::memory_order_release);
+}
+
+bool IsPtsCancellationRequested(const PtsCancellationHandle& cancellation) {
+    return cancellation && cancellation->requested.load(std::memory_order_acquire);
+}
+
+struct PtsProgressMessage {
+    int percent = 0;
+    std::wstring message;
+};
+
+struct PtsBackgroundResult {
+    bool ok = false;
+    bool cancelled = false;
+    DWORD workerThreadId = 0;
+    std::wstring summary;
+    std::wstring error;
+};
+
+using PtsBackgroundOperation = std::function<bool(
+    const PtsProgressCallback&, const PtsCancellationCallback&,
+    std::wstring&, std::wstring&)>;
+
+enum class PtsOperationKind {
+    None,
+    Backup,
+    Restore,
+};
+
+struct PtsBackgroundTaskContext {
+    HWND notifyWindow = nullptr;
+    PtsBackgroundOperation operation;
+    PtsCancellationHandle cancellation;
+};
+
+DWORD WINAPI PtsBackgroundTaskThreadProc(void* parameter) {
+    std::unique_ptr<PtsBackgroundTaskContext> context(
+        static_cast<PtsBackgroundTaskContext*>(parameter));
+    auto* result = new (std::nothrow) PtsBackgroundResult{};
+    if (!result) return 1;
+    result->workerThreadId = GetCurrentThreadId();
+
+    const HWND notifyWindow = context->notifyWindow;
+    const PtsCancellationHandle cancellation = context->cancellation;
+    int lastPercent = -1;
+    ULONGLONG lastPost = 0;
+    PtsProgressCallback progress = [notifyWindow, lastPercent, lastPost](
+                                       int percent, const std::wstring& message) mutable {
+        int boundedPercent = std::clamp(percent, 0, 100);
+        ULONGLONG now = GetTickCount64();
+        bool terminal = boundedPercent == 0 || boundedPercent == 100;
+        if (!terminal && boundedPercent == lastPercent && now - lastPost < 75) return;
+        lastPercent = boundedPercent;
+        lastPost = now;
+        try {
+            auto* update = new PtsProgressMessage{boundedPercent, message};
+            if (!PostMessageW(notifyWindow, WM_APP_PTS_PROGRESS, 0,
+                              reinterpret_cast<LPARAM>(update))) {
+                delete update;
+            }
+        } catch (...) {
+        }
+    };
+    PtsCancellationCallback cancelled = [cancellation] {
+        return IsPtsCancellationRequested(cancellation);
+    };
+
+    try {
+        result->ok = context->operation(progress, cancelled, result->summary, result->error);
+    } catch (...) {
+        result->ok = false;
+        result->error = L"Lỗi không xác định trong thao tác Pts.";
+    }
+    result->cancelled = !result->ok && IsPtsCancellationRequested(cancellation);
+    if (!PostMessageW(notifyWindow, WM_APP_PTS_OPERATION_DONE, 0,
+                      reinterpret_cast<LPARAM>(result))) {
+        delete result;
+    }
+    return 0;
+}
+
+bool StartPtsBackgroundTask(HWND notifyWindow, const PtsBackgroundOperation& operation,
+                            const PtsCancellationHandle& cancellation,
+                            HANDLE& workerThread, std::wstring& error) {
+    workerThread = nullptr;
+    if (!notifyWindow || !IsWindow(notifyWindow) || !operation || !cancellation) {
+        error = L"Không thể bắt đầu thao tác Pts chạy nền.";
+        return false;
+    }
+
+    auto* context = new (std::nothrow) PtsBackgroundTaskContext{
+        notifyWindow, operation, cancellation};
+    if (!context) {
+        error = L"Không đủ bộ nhớ để bắt đầu thao tác Pts.";
+        return false;
+    }
+    workerThread = CreateThread(nullptr, 0, PtsBackgroundTaskThreadProc, context, 0, nullptr);
+    if (!workerThread) {
+        delete context;
+        error = L"Không tạo được worker cho thao tác Pts.";
+        return false;
+    }
+    return true;
+}
 
 constexpr char kAfangMagic[8] = {'A', 'F', 'A', 'N', 'G', 'P', 'S', '1'};
 constexpr uint32_t kAfangVersion = 1;
@@ -1030,18 +1153,24 @@ bool HasLikelyCacheDirectoryName(const std::wstring& name) {
            lower.find(L"media cache") != std::wstring::npos;
 }
 
-void CollectFilesRecursive(const std::wstring& directory, std::vector<std::wstring>& files,
+bool CollectFilesRecursive(const std::wstring& directory, std::vector<std::wstring>& files,
                            bool skipLikelyCaches,
                            const PtsProgressCallback& progress = {},
                            int progressPercent = 0,
                            const std::wstring& progressLabel = L"",
-                           size_t* visited = nullptr) {
+                           size_t* visited = nullptr,
+                           const PtsCancellationCallback& cancelled = {}) {
+    if (cancelled && cancelled()) return false;
     std::wstring pattern = JoinPath(directory, L"*");
     WIN32_FIND_DATAW data{};
     HANDLE find = FindFirstFileW(pattern.c_str(), &data);
-    if (find == INVALID_HANDLE_VALUE) return;
+    if (find == INVALID_HANDLE_VALUE) return !(cancelled && cancelled());
 
     do {
+        if (cancelled && cancelled()) {
+            FindClose(find);
+            return false;
+        }
         std::wstring name = data.cFileName;
         if (name == L"." || name == L"..") continue;
         if (visited) {
@@ -1055,14 +1184,18 @@ void CollectFilesRecursive(const std::wstring& directory, std::vector<std::wstri
         if (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
         if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             if (skipLikelyCaches && HasLikelyCacheDirectoryName(name)) continue;
-            CollectFilesRecursive(full, files, skipLikelyCaches, progress,
-                                  progressPercent, progressLabel, visited);
+            if (!CollectFilesRecursive(full, files, skipLikelyCaches, progress,
+                                       progressPercent, progressLabel, visited, cancelled)) {
+                FindClose(find);
+                return false;
+            }
         } else {
             files.push_back(full);
         }
     } while (FindNextFileW(find, &data));
 
     FindClose(find);
+    return true;
 }
 
 void FindPhotoshopDirectoriesRecursive(const std::wstring& directory, int depth,
@@ -1416,16 +1549,20 @@ std::wstring DefaultPhotoshopRelativeRootForLabel(const std::wstring& label) {
     return IsValidWindowsBaseFileName(label) ? JoinPath(L"Adobe", label) : L"";
 }
 
-void AddPhotoshopItemsFromRoot(const PtsPhotoshopRoot& root,
+bool AddPhotoshopItemsFromRoot(const PtsPhotoshopRoot& root,
                                std::vector<PtsBackupItem>& items,
                                std::set<std::wstring>& seen,
                                const PtsProgressCallback& progress,
-                               size_t& visited) {
+                               size_t& visited,
+                               const PtsCancellationCallback& cancelled) {
     std::vector<std::wstring> files;
-    CollectFilesRecursive(root.scanRoot, files, true, progress, 8,
-                          L"Đang quét settings Photoshop", &visited);
+    if (!CollectFilesRecursive(root.scanRoot, files, true, progress, 8,
+                               L"Đang quét settings Photoshop", &visited, cancelled)) {
+        return false;
+    }
     size_t processed = 0;
     for (const auto& file : files) {
+        if (cancelled && cancelled()) return false;
         ++processed;
         if (progress && (processed == 1 || processed % 64 == 0)) {
             progress(8, L"Đang kiểm tra settings của " + root.versionLabel + L" (" +
@@ -1446,11 +1583,13 @@ void AddPhotoshopItemsFromRoot(const PtsPhotoshopRoot& root,
         item.size = size;
         items.push_back(std::move(item));
     }
+    return true;
 }
 
-void GatherPhotoshopSettingItems(std::vector<PtsBackupItem>& items,
+bool GatherPhotoshopSettingItems(std::vector<PtsBackupItem>& items,
                                  const PtsBackupOptions& options,
-                                 const PtsProgressCallback& progress = {}) {
+                                 const PtsProgressCallback& progress = {},
+                                 const PtsCancellationCallback& cancelled = {}) {
     std::set<std::wstring> seen;
     bool hasVersionFilter = !options.selectedPhotoshopVersionKeys.empty() ||
                             !options.selectedPhotoshopVersionLabels.empty();
@@ -1458,6 +1597,7 @@ void GatherPhotoshopSettingItems(std::vector<PtsBackupItem>& items,
     std::vector<PtsPhotoshopRoot> roots = DiscoverInstalledPhotoshopRoots();
     size_t visited = 0;
     for (const auto& root : roots) {
+        if (cancelled && cancelled()) return false;
         if (hasVersionFilter &&
             options.selectedPhotoshopVersionKeys.count(root.versionKey) == 0 &&
             options.selectedPhotoshopVersionLabels.count(LowerWide(root.versionLabel)) == 0) {
@@ -1466,12 +1606,15 @@ void GatherPhotoshopSettingItems(std::vector<PtsBackupItem>& items,
         if (progress) {
             progress(8, L"Đang quét " + root.versionLabel + L"...");
         }
-        AddPhotoshopItemsFromRoot(root, items, seen, progress, visited);
+        if (!AddPhotoshopItemsFromRoot(root, items, seen, progress, visited, cancelled)) {
+            return false;
+        }
     }
     if (progress) {
         progress(12, L"Đã tìm thấy " + std::to_wstring(items.size()) +
                          L" file settings phù hợp.");
     }
+    return !(cancelled && cancelled());
 }
 
 bool IsDefaultWindowsFont(const std::wstring& fileName, const std::wstring& displayName) {
@@ -1543,18 +1686,23 @@ void AddFontItem(const std::wstring& path, const std::wstring& displayName,
     items.push_back(std::move(item));
 }
 
-void GatherFontsFromRegistry(HKEY hive, bool userScope, std::vector<PtsBackupItem>& items,
+bool GatherFontsFromRegistry(HKEY hive, bool userScope, std::vector<PtsBackupItem>& items,
                              std::set<std::wstring>& seen,
                              const PtsProgressCallback& progress,
                              int progressPercent,
-                             size_t& visited) {
+                             size_t& visited,
+                             const PtsCancellationCallback& cancelled) {
     HKEY key = nullptr;
     if (RegOpenKeyExW(hive, L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Fonts",
                       0, KEY_READ, &key) != ERROR_SUCCESS) {
-        return;
+        return !(cancelled && cancelled());
     }
 
     for (DWORD index = 0;; ++index) {
+        if (cancelled && cancelled()) {
+            RegCloseKey(key);
+            return false;
+        }
         wchar_t valueName[512] = {};
         DWORD valueNameLen = static_cast<DWORD>(std::size(valueName));
         wchar_t data[2048] = {};
@@ -1577,27 +1725,37 @@ void GatherFontsFromRegistry(HKEY hive, bool userScope, std::vector<PtsBackupIte
     }
 
     RegCloseKey(key);
+    return true;
 }
 
-void GatherFontItems(std::vector<PtsBackupItem>& items,
-                     const PtsProgressCallback& progress = {}) {
+bool GatherFontItems(std::vector<PtsBackupItem>& items,
+                     const PtsProgressCallback& progress = {},
+                     const PtsCancellationCallback& cancelled = {}) {
     std::set<std::wstring> seen;
     size_t registryValues = 0;
     if (progress) progress(14, L"Đang đọc font của người dùng hiện tại...");
-    GatherFontsFromRegistry(HKEY_CURRENT_USER, true, items, seen, progress, 15,
-                            registryValues);
+    if (!GatherFontsFromRegistry(HKEY_CURRENT_USER, true, items, seen, progress, 15,
+                                 registryValues, cancelled)) {
+        return false;
+    }
     if (progress) progress(16, L"Đang đọc font đã cài trên máy...");
-    GatherFontsFromRegistry(HKEY_LOCAL_MACHINE, false, items, seen, progress, 17,
-                            registryValues);
+    if (!GatherFontsFromRegistry(HKEY_LOCAL_MACHINE, false, items, seen, progress, 17,
+                                 registryValues, cancelled)) {
+        return false;
+    }
 
     std::wstring userFonts = JoinPath(GetEnvPath(L"LOCALAPPDATA"), L"Microsoft\\Windows\\Fonts");
     if (DirectoryExists(userFonts)) {
         std::vector<std::wstring> files;
         size_t visited = 0;
-        CollectFilesRecursive(userFonts, files, false, progress, 18,
-                              L"Đang quét thư mục font người dùng", &visited);
+        if (!CollectFilesRecursive(userFonts, files, false, progress, 18,
+                                   L"Đang quét thư mục font người dùng", &visited,
+                                   cancelled)) {
+            return false;
+        }
         size_t processed = 0;
         for (const auto& file : files) {
+            if (cancelled && cancelled()) return false;
             ++processed;
             if (progress && (processed == 1 || processed % 64 == 0)) {
                 progress(19, L"Đang kiểm tra font người dùng (" +
@@ -1606,6 +1764,7 @@ void GatherFontItems(std::vector<PtsBackupItem>& items,
             AddFontItem(file, FileNameOnly(file), true, items, seen);
         }
     }
+    return !(cancelled && cancelled());
 }
 
 bool WriteAll(HANDLE file, const void* data, DWORD bytes) {
@@ -1856,20 +2015,28 @@ std::wstring FormatBytes(uint64_t bytes) {
 }
 
 bool CreatePtsBackupArchive(const std::wstring& path, bool includeSettings, bool includeFonts,
-                            const PtsBackupOptions& options,
-                            const PtsProgressCallback& progress, std::wstring& summary,
-                            std::wstring& error) {
+                             const PtsBackupOptions& options,
+                             const PtsProgressCallback& progress, std::wstring& summary,
+                             std::wstring& error,
+                             const PtsCancellationCallback& cancelled = {}) {
     std::vector<PtsBackupItem> items;
+    auto cancellationRequested = [&] { return cancelled && cancelled(); };
     if (includeSettings) {
         progress(5, options.selectedPhotoshopVersionLabel.empty()
                         ? L"Đang tìm settings Photoshop trong AppData..."
                         : L"Đang tìm settings của " + options.selectedPhotoshopVersionLabel + L"...");
-        GatherPhotoshopSettingItems(items, options, progress);
+        if (!GatherPhotoshopSettingItems(items, options, progress, cancelled)) {
+            error = L"Đã hủy backup Pts.";
+            return false;
+        }
     }
     size_t settingsCount = items.size();
     if (includeFonts) {
         progress(includeSettings ? 14 : 8, L"Đang tìm font custom...");
-        GatherFontItems(items, progress);
+        if (!GatherFontItems(items, progress, cancelled)) {
+            error = L"Đã hủy backup Pts.";
+            return false;
+        }
     }
     size_t fontCount = items.size() - settingsCount;
     if (items.empty()) {
@@ -1878,6 +2045,10 @@ bool CreatePtsBackupArchive(const std::wstring& path, bool includeSettings, bool
     }
 
     progress(20, L"Đang tạo file .afang...");
+    if (cancellationRequested()) {
+        error = L"Đã hủy backup Pts.";
+        return false;
+    }
     HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE | GENERIC_READ, 0, nullptr,
                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) {
@@ -1892,8 +2063,13 @@ bool CreatePtsBackupArchive(const std::wstring& path, bool includeSettings, bool
     uint32_t skipped = 0;
     uint64_t sourceBytes = 0;
     uint64_t archiveBytes = 0;
+    bool cancellationObserved = false;
 
     for (size_t i = 0; ok && i < items.size(); ++i) {
+        if (cancellationRequested()) {
+            cancellationObserved = true;
+            break;
+        }
         const auto& item = items[i];
         int percent = 20 + static_cast<int>((i * 72) / std::max<size_t>(1, items.size()));
         progress(percent, L"Đang nén " + FileNameOnly(item.sourcePath) +
@@ -1909,6 +2085,10 @@ bool CreatePtsBackupArchive(const std::wstring& path, bool includeSettings, bool
         uint8_t method = 0;
         std::vector<uint8_t> stored;
         CompressForArchive(raw, method, stored);
+        if (cancellationRequested()) {
+            cancellationObserved = true;
+            break;
+        }
         sourceBytes += static_cast<uint64_t>(raw.size());
         archiveBytes += static_cast<uint64_t>(stored.size());
 
@@ -1925,13 +2105,20 @@ bool CreatePtsBackupArchive(const std::wstring& path, bool includeSettings, bool
         }
     }
 
-    if (ok) {
+    if (cancellationRequested()) cancellationObserved = true;
+    if (ok && !cancellationObserved) {
         LARGE_INTEGER pos{};
         pos.QuadPart = sizeof(kAfangMagic) + sizeof(uint32_t);
         ok = SetFilePointerEx(file, pos, nullptr, FILE_BEGIN) &&
              WriteU32File(file, writtenEntries);
     }
     CloseHandle(file);
+
+    if (cancellationObserved) {
+        DeleteFileW(path.c_str());
+        error = L"Đã hủy backup Pts. File backup chưa hoàn tất đã được xóa.";
+        return false;
+    }
 
     if (!ok || writtenEntries == 0) {
         DeleteFileW(path.c_str());
@@ -2016,7 +2203,8 @@ std::wstring NonConflictingFontRegistryValueName(HKEY key, const RestoredUserFon
 
 FontRegistrationResult RegisterRestoredUserFonts(
     const std::vector<RestoredUserFont>& fonts,
-    const PtsProgressCallback& progress = {}) {
+    const PtsProgressCallback& progress = {},
+    const PtsCancellationCallback& cancelled = {}) {
     FontRegistrationResult result{};
     HKEY key = nullptr;
     RegCreateKeyExW(HKEY_CURRENT_USER,
@@ -2024,6 +2212,7 @@ FontRegistrationResult RegisterRestoredUserFonts(
                     0, nullptr, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, nullptr, &key, nullptr);
 
     for (size_t index = 0; index < fonts.size(); ++index) {
+        if (cancelled && cancelled()) break;
         const auto& font = fonts[index];
         if (AddFontResourceExW(font.path.c_str(), 0, nullptr) > 0) {
             ++result.resourceRegistrations;
@@ -2212,7 +2401,8 @@ void AddArchiveVersion(PtsArchiveScanResult& scan, const std::wstring& label,
 
 bool InspectPtsArchiveVersions(const std::wstring& path, PtsArchiveScanResult& scan,
                                std::wstring& error,
-                               const PtsProgressCallback& progress = {}) {
+                               const PtsProgressCallback& progress = {},
+                               const PtsCancellationCallback& cancelled = {}) {
     scan = PtsArchiveScanResult{};
     HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
@@ -2231,6 +2421,11 @@ bool InspectPtsArchiveVersions(const std::wstring& path, PtsArchiveScanResult& s
     if (progress) progress(1, L"Đang đọc metadata file .afang...");
 
     for (uint32_t i = 0; i < count; ++i) {
+        if (cancelled && cancelled()) {
+            CloseHandle(file);
+            error = L"Đã hủy kiểm tra file .afang.";
+            return false;
+        }
         uint8_t kindByte = 0;
         std::wstring rootToken;
         std::wstring relativePath;
@@ -3577,12 +3772,18 @@ std::wstring RestoreTargetRootForToken(const PtsRestoreOptions& options,
 }
 
 bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& options,
-                             const PtsProgressCallback& progress,
-                             std::wstring& summary, std::wstring& error) {
+                              const PtsProgressCallback& progress,
+                              std::wstring& summary, std::wstring& error,
+                              const PtsCancellationCallback& cancelled = {}) {
+    auto cancellationRequested = [&] { return cancelled && cancelled(); };
+    if (cancellationRequested()) {
+        error = L"Đã hủy restore Pts.";
+        return false;
+    }
     bool archiveHasSettings = options.archiveHasSettings;
     if (!options.archiveValidated) {
         PtsArchiveScanResult preflight{};
-        if (!InspectPtsArchiveVersions(path, preflight, error, progress)) return false;
+        if (!InspectPtsArchiveVersions(path, preflight, error, progress, cancelled)) return false;
         archiveHasSettings = preflight.hasSettings;
     }
 
@@ -3617,13 +3818,28 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
     std::set<std::wstring> restoredSettingsRoots;
     std::set<std::wstring> targetSettingsFoldersForRegistry;
     std::vector<RestoredUserFont> fontsToRegister;
+    auto cancellationError = [&] {
+        return restored > 0
+                   ? L"Đã hủy restore Pts. Các file đã restore trước đó được giữ lại."
+                   : L"Đã hủy restore Pts.";
+    };
 
     for (uint32_t i = 0; i < count; ++i) {
+        if (cancellationRequested()) {
+            CloseHandle(file);
+            error = cancellationError();
+            return false;
+        }
         if (i == 0 || i + 1 == count || (i % 25) == 0) {
             int percent = 5 + static_cast<int>(
                 (static_cast<uint64_t>(i) * 88) / std::max<uint32_t>(1, count));
             progress(percent, L"Đang restore file " + std::to_wstring(i + 1) + L"/" +
                                   std::to_wstring(count) + L"...");
+        }
+        if (cancellationRequested()) {
+            CloseHandle(file);
+            error = cancellationError();
+            return false;
         }
 
         uint8_t kindByte = 0;
@@ -3676,6 +3892,11 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
             error = L"Không giải nén được dữ liệu trong .afang.";
             return false;
         }
+        if (cancellationRequested()) {
+            CloseHandle(file);
+            error = cancellationError();
+            return false;
+        }
 
         if (kindByte == static_cast<uint8_t>(PtsEntryKind::Font)) {
             if (localAppData.empty()) {
@@ -3704,6 +3925,11 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
             if (alreadyPresent) {
                 ++fontsAlreadyPresent;
             } else {
+                if (cancellationRequested()) {
+                    CloseHandle(file);
+                    error = cancellationError();
+                    return false;
+                }
                 if (!WriteBytesToFile(destination, raw, error)) {
                     CloseHandle(file);
                     error = L"Không ghi được font " + FileNameOnly(destination) + L".\n" + error;
@@ -3765,6 +3991,11 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
 
         bool convertedWorkspaceForEntry = false;
         for (const auto& targetRelativePath : destinationRelativePaths) {
+            if (cancellationRequested()) {
+                CloseHandle(file);
+                error = cancellationError();
+                return false;
+            }
             if (!IsAllowedPhotoshopSettingsRelativePath(targetRelativePath)) {
                 CloseHandle(file);
                 error = L"Alias restore Photoshop settings không hợp lệ.";
@@ -3819,6 +4050,10 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
     }
 
     CloseHandle(file);
+    if (cancellationRequested()) {
+        error = cancellationError();
+        return false;
+    }
     if (options.HasTargetMapping() && settingsRestored == 0 && archiveHasSettings) {
         error = L"Không có settings phù hợp với Photoshop version đã chọn.";
         return false;
@@ -3831,7 +4066,11 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
     FontRegistrationResult fontRegistration{};
     if (!fontsToRegister.empty()) {
         progress(95, L"Đang đăng ký font cho người dùng hiện tại...");
-        fontRegistration = RegisterRestoredUserFonts(fontsToRegister, progress);
+        fontRegistration = RegisterRestoredUserFonts(fontsToRegister, progress, cancelled);
+        if (cancellationRequested()) {
+            error = cancellationError();
+            return false;
+        }
         DWORD_PTR unused = 0;
         SendMessageTimeoutW(HWND_BROADCAST, WM_FONTCHANGE, 0, 0,
                             SMTO_ABORTIFHUNG, 1000, &unused);
@@ -3839,6 +4078,10 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
 
     if (options.HasTargetMapping() && settingsRestored > 0 &&
         !targetSettingsFoldersForRegistry.empty()) {
+        if (cancellationRequested()) {
+            error = cancellationError();
+            return false;
+        }
         progress(97, L"Đang cập nhật SettingsFilePath...");
         registrySettingsPathUpdates = UpdatePhotoshopSettingsFilePathRegistry(
             options.targetVersionLabel, targetSettingsFoldersForRegistry);
@@ -4189,6 +4432,10 @@ private:
         ULONGLONG lastProgressPaint = 0;
         std::wstring lastProgressMessage;
         bool busy = false;
+        bool cancelRequested = false;
+        HANDLE workerThread = nullptr;
+        std::shared_ptr<void> cancellation;
+        int operationKind = static_cast<int>(PtsOperationKind::None);
     };
 
     struct ChoiceDialogState {
@@ -4350,20 +4597,60 @@ private:
                     return 0;
                 }
                 break;
+            case WM_APP_PTS_PROGRESS: {
+                auto* update = reinterpret_cast<PtsProgressMessage*>(lp);
+                if (state && state->app && update) {
+                    state->app->HandlePtsBackgroundProgress(state, *update);
+                }
+                delete update;
+                return 0;
+            }
+            case WM_APP_PTS_OPERATION_DONE: {
+                auto* result = reinterpret_cast<PtsBackgroundResult*>(lp);
+                if (state && state->app && result) {
+                    state->app->HandlePtsBackgroundCompletion(state, *result);
+                }
+                delete result;
+                return 0;
+            }
             case WM_KEYDOWN:
-                if (wp == VK_ESCAPE && state && !state->busy) {
-                    DestroyWindow(hwnd);
+                if (wp == VK_ESCAPE && state) {
+                    if (state->busy && state->app) {
+                        state->app->RequestPtsOperationCancellation(state);
+                    } else {
+                        DestroyWindow(hwnd);
+                    }
                     return 0;
                 }
                 break;
             case WM_CLOSE:
                 if (state && state->busy) {
-                    state->app->UpdatePtsProgress(state, state->progress,
-                                                  L"Đang xử lý, vui lòng chờ hoàn tất...");
+                    state->app->RequestPtsOperationCancellation(state);
                     return 0;
                 }
                 DestroyWindow(hwnd);
                 return 0;
+            case WM_DESTROY:
+                if (state && state->workerThread) {
+                    RequestPtsCancellation(
+                        std::static_pointer_cast<PtsCancellationState>(state->cancellation));
+                    WaitForSingleObject(state->workerThread, INFINITE);
+                    CloseHandle(state->workerThread);
+                    state->workerThread = nullptr;
+                    MSG pending{};
+                    while (PeekMessageW(&pending, hwnd, WM_APP_PTS_PROGRESS,
+                                        WM_APP_PTS_OPERATION_DONE, PM_REMOVE)) {
+                        if (pending.message == WM_APP_PTS_PROGRESS) {
+                            delete reinterpret_cast<PtsProgressMessage*>(pending.lParam);
+                        } else if (pending.message == WM_APP_PTS_OPERATION_DONE) {
+                            delete reinterpret_cast<PtsBackgroundResult*>(pending.lParam);
+                        }
+                    }
+                }
+                break;
+            case WM_NCDESTROY:
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                break;
         }
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
@@ -6010,7 +6297,8 @@ private:
         }
     }
 
-    void UpdatePtsProgress(PtsDialogState* state, int percent, const std::wstring& message) {
+    void UpdatePtsProgress(PtsDialogState* state, int percent, const std::wstring& message,
+                           bool pumpMessages = true) {
         if (!state || !state->dialog) return;
         int nextProgress = std::clamp(percent, 0, 100);
         ULONGLONG now = GetTickCount64();
@@ -6033,15 +6321,119 @@ private:
         UpdateWindow(state->dialog);
         if (state->status) UpdateWindow(state->status);
         if (state->percent) UpdateWindow(state->percent);
-        PumpPtsDialogMessages(state->dialog);
+        if (pumpMessages) PumpPtsDialogMessages(state->dialog);
     }
 
     void SetPtsDialogBusy(PtsDialogState* state, bool busy) {
         if (!state) return;
         state->busy = busy;
         for (HWND button : {state->backupSettings, state->backupFonts, state->backupAll,
-                            state->restore, state->close}) {
+                            state->restore}) {
             if (button) EnableWindow(button, busy ? FALSE : TRUE);
+        }
+        if (state->close) {
+            EnableWindow(state->close, TRUE);
+            SetWindowTextW(state->close, busy ? L"Hủy" : L"Đóng");
+        }
+        if (!busy) {
+            state->cancelRequested = false;
+            state->cancellation.reset();
+            state->operationKind = static_cast<int>(PtsOperationKind::None);
+        }
+    }
+
+    bool StartPtsUiBackgroundOperation(PtsDialogState* state, PtsOperationKind kind,
+                                       const PtsBackgroundOperation& operation,
+                                       const std::wstring& startMessage) {
+        if (!state || !state->dialog || state->busy) return false;
+        SetPtsDialogBusy(state, true);
+        state->operationKind = static_cast<int>(kind);
+        PtsCancellationHandle cancellation;
+        try {
+            cancellation = CreatePtsCancellationHandle();
+            state->cancellation = cancellation;
+        } catch (...) {
+            SetPtsDialogBusy(state, false);
+            UpdatePtsProgress(state, 0, L"Không đủ bộ nhớ để bắt đầu thao tác Pts.");
+            return false;
+        }
+        UpdatePtsProgress(state, 0, startMessage, false);
+
+        std::wstring startError;
+        if (!StartPtsBackgroundTask(state->dialog, operation, cancellation,
+                                    state->workerThread, startError)) {
+            SetPtsDialogBusy(state, false);
+            UpdatePtsProgress(state, 0, startError, false);
+            MessageBoxW(state->dialog, startError.c_str(), L"Pts",
+                        MB_OK | MB_ICONERROR | MB_SETFOREGROUND |
+                            (topMost_ ? MB_TOPMOST : 0));
+            return false;
+        }
+        return true;
+    }
+
+    void HandlePtsBackgroundProgress(PtsDialogState* state,
+                                     const PtsProgressMessage& update) {
+        if (!state || !state->busy || state->cancelRequested) return;
+        UpdatePtsProgress(state, update.percent, update.message, false);
+    }
+
+    void RequestPtsOperationCancellation(PtsDialogState* state) {
+        if (!state || !state->busy || state->cancelRequested) return;
+        state->cancelRequested = true;
+        RequestPtsCancellation(
+            std::static_pointer_cast<PtsCancellationState>(state->cancellation));
+        if (state->close) {
+            SetWindowTextW(state->close, L"Đang hủy...");
+            EnableWindow(state->close, FALSE);
+        }
+        UpdatePtsProgress(state, state->progress,
+                          L"Đang hủy an toàn sau bước hiện tại...", false);
+        SetStatus(L"Pts: đang hủy thao tác...");
+    }
+
+    void HandlePtsBackgroundCompletion(PtsDialogState* state,
+                                       const PtsBackgroundResult& result) {
+        if (!state) return;
+        if (state->workerThread) {
+            WaitForSingleObject(state->workerThread, INFINITE);
+            CloseHandle(state->workerThread);
+            state->workerThread = nullptr;
+        }
+        PtsOperationKind kind = static_cast<PtsOperationKind>(state->operationKind);
+        SetPtsDialogBusy(state, false);
+
+        if (result.cancelled) {
+            std::wstring message = result.error.empty()
+                                       ? L"Đã hủy thao tác Pts."
+                                       : CompactPtsNotice(result.error);
+            UpdatePtsProgress(state, 0, message, false);
+            SetStatus(kind == PtsOperationKind::Backup
+                          ? L"Pts: đã hủy backup."
+                          : L"Pts: đã hủy restore.");
+            return;
+        }
+
+        const bool backup = kind == PtsOperationKind::Backup;
+        const wchar_t* title = backup ? L"Pts backup" : L"Pts restore";
+        if (result.ok) {
+            std::wstring summary = CompactPtsNotice(result.summary);
+            UpdatePtsProgress(state, 100, summary, false);
+            SetStatus(backup ? L"Pts: đã tạo backup .afang."
+                             : L"Pts: restore hoàn tất.");
+            MessageBoxW(state->dialog, summary.c_str(), title,
+                        MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND |
+                            (topMost_ ? MB_TOPMOST : 0));
+        } else {
+            std::wstring error = CompactPtsNotice(result.error.empty()
+                                                       ? L"Thao tác Pts thất bại."
+                                                       : result.error);
+            UpdatePtsProgress(state, 0, error, false);
+            SetStatus(backup ? L"Pts: backup thất bại."
+                             : L"Pts: restore thất bại.");
+            MessageBoxW(state->dialog, error.c_str(), title,
+                        MB_OK | MB_ICONERROR | MB_SETFOREGROUND |
+                            (topMost_ ? MB_TOPMOST : 0));
         }
     }
 
@@ -6225,12 +6617,13 @@ private:
 
     bool PrepareRestoreOptions(HWND owner, const std::wstring& path, PtsRestoreOptions& options,
                                std::wstring& error,
-                               const PtsProgressCallback& progress = {}) {
+                               const PtsProgressCallback& progress = {},
+                               const PtsCancellationCallback& cancelled = {}) {
         options = PtsRestoreOptions{};
         error.clear();
 
         PtsArchiveScanResult scan{};
-        if (!InspectPtsArchiveVersions(path, scan, error, progress)) return false;
+        if (!InspectPtsArchiveVersions(path, scan, error, progress, cancelled)) return false;
         options.archiveHasSettings = scan.hasSettings;
         options.archiveValidated = true;
         if (!scan.hasSettings) return true;
@@ -6295,32 +6688,18 @@ private:
             return;
         }
 
-        SetPtsDialogBusy(state, true);
-        UpdatePtsProgress(state, 0, L"Bắt đầu backup, vui lòng chờ...");
-        std::wstring summary;
-        std::wstring error;
-        auto progress = [this, state](int percent, const std::wstring& message) {
-            UpdatePtsProgress(state, percent, message);
-        };
-        bool ok = CreatePtsBackupArchive(path, includeSettings, includeFonts, options,
-                                         progress, summary, error);
-        SetPtsDialogBusy(state, false);
-
-        if (ok) {
-            summary = CompactPtsNotice(summary);
-            UpdatePtsProgress(state, 100, summary);
-            SetStatus(L"Pts: đã tạo backup .afang.");
-            MessageBoxW(state->dialog, summary.c_str(), L"Pts backup",
-                        MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND |
-                            (topMost_ ? MB_TOPMOST : 0));
-        } else {
-            error = CompactPtsNotice(error);
-            UpdatePtsProgress(state, 0, error);
-            SetStatus(L"Pts: backup thất bại.");
-            MessageBoxW(state->dialog, error.c_str(), L"Pts backup",
-                        MB_OK | MB_ICONERROR | MB_SETFOREGROUND |
-                            (topMost_ ? MB_TOPMOST : 0));
-        }
+        std::shared_ptr<void> backupOptions = std::make_shared<PtsBackupOptions>(options);
+        PtsBackgroundOperation operation =
+            [path, includeSettings, includeFonts, backupOptions](
+                const PtsProgressCallback& progress,
+                const PtsCancellationCallback& cancelled,
+                std::wstring& summary, std::wstring& error) {
+                auto typedOptions = std::static_pointer_cast<PtsBackupOptions>(backupOptions);
+                return CreatePtsBackupArchive(path, includeSettings, includeFonts, *typedOptions,
+                                              progress, summary, error, cancelled);
+            };
+        StartPtsUiBackgroundOperation(state, PtsOperationKind::Backup, operation,
+                                      L"Bắt đầu backup, có thể bấm Hủy bất kỳ lúc nào...");
     }
 
     void RunPtsRestore(PtsDialogState* state) {
@@ -6333,13 +6712,32 @@ private:
         PtsRestoreOptions options;
         std::wstring prepareError;
         SetPtsDialogBusy(state, true);
+        state->operationKind = static_cast<int>(PtsOperationKind::Restore);
+        try {
+            state->cancellation = CreatePtsCancellationHandle();
+        } catch (...) {
+            SetPtsDialogBusy(state, false);
+            UpdatePtsProgress(state, 0, L"Không đủ bộ nhớ để kiểm tra file .afang.");
+            return;
+        }
         auto progress = [this, state](int percent, const std::wstring& message) {
             UpdatePtsProgress(state, percent, message);
         };
+        std::shared_ptr<void> preflightCancellation = state->cancellation;
+        PtsCancellationCallback cancelled = [preflightCancellation] {
+            return IsPtsCancellationRequested(
+                std::static_pointer_cast<PtsCancellationState>(preflightCancellation));
+        };
         UpdatePtsProgress(state, state ? state->progress : 0, L"Đang kiểm tra file .afang...");
         if (!PrepareRestoreOptions(state ? state->dialog : hwnd_, path, options, prepareError,
-                                   progress)) {
+                                   progress, cancelled)) {
+            bool wasCancelled = state->cancelRequested || cancelled();
             SetPtsDialogBusy(state, false);
+            if (wasCancelled) {
+                UpdatePtsProgress(state, 0, L"Đã hủy restore Pts.", false);
+                SetStatus(L"Pts: đã hủy restore.");
+                return;
+            }
             if (prepareError.empty()) {
                 UpdatePtsProgress(state, state ? state->progress : 0, L"Đã hủy chọn phiên bản khôi phục.");
             } else {
@@ -6349,6 +6747,13 @@ private:
                             MB_OK | MB_ICONERROR | MB_SETFOREGROUND |
                                 (topMost_ ? MB_TOPMOST : 0));
             }
+            return;
+        }
+
+        if (state->cancelRequested || cancelled()) {
+            SetPtsDialogBusy(state, false);
+            UpdatePtsProgress(state, 0, L"Đã hủy restore Pts.", false);
+            SetStatus(L"Pts: đã hủy restore.");
             return;
         }
 
@@ -6365,31 +6770,31 @@ private:
             return;
         }
 
-        UpdatePtsProgress(state, 0, L"Bắt đầu restore .afang...");
-        std::wstring summary;
-        std::wstring error;
-        bool ok = RestorePtsBackupArchive(path, options, progress, summary, error);
         SetPtsDialogBusy(state, false);
-
-        if (ok) {
-            summary = CompactPtsNotice(summary);
-            UpdatePtsProgress(state, 100, summary);
-            SetStatus(L"Pts: restore hoàn tất.");
-            MessageBoxW(state->dialog, summary.c_str(), L"Pts restore",
-                        MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND |
-                            (topMost_ ? MB_TOPMOST : 0));
-        } else {
-            error = CompactPtsNotice(error);
-            UpdatePtsProgress(state, 0, error);
-            SetStatus(L"Pts: restore thất bại.");
-            MessageBoxW(state->dialog, error.c_str(), L"Pts restore",
-                        MB_OK | MB_ICONERROR | MB_SETFOREGROUND |
-                            (topMost_ ? MB_TOPMOST : 0));
-        }
+        std::shared_ptr<void> restoreOptions = std::make_shared<PtsRestoreOptions>(options);
+        PtsBackgroundOperation operation =
+            [path, restoreOptions](const PtsProgressCallback& workerProgress,
+                            const PtsCancellationCallback& workerCancelled,
+                            std::wstring& summary, std::wstring& error) {
+                auto typedOptions = std::static_pointer_cast<PtsRestoreOptions>(restoreOptions);
+                return RestorePtsBackupArchive(path, *typedOptions, workerProgress,
+                                               summary, error, workerCancelled);
+            };
+        StartPtsUiBackgroundOperation(state, PtsOperationKind::Restore, operation,
+                                      L"Bắt đầu restore, có thể bấm Hủy bất kỳ lúc nào...");
     }
 
     void HandlePtsDialogCommand(PtsDialogState* state, int id) {
-        if (!state || state->busy) return;
+        if (!state) return;
+        if (id == IDCANCEL) {
+            if (state->busy) {
+                RequestPtsOperationCancellation(state);
+            } else {
+                DestroyWindow(state->dialog);
+            }
+            return;
+        }
+        if (state->busy) return;
         switch (id) {
             case ID_PTS_BACKUP_SETTINGS:
                 RunPtsBackup(state, true, false, L"photoshop-settings.afang");
@@ -6402,9 +6807,6 @@ private:
                 break;
             case ID_PTS_RESTORE:
                 RunPtsRestore(state);
-                break;
-            case IDCANCEL:
-                DestroyWindow(state->dialog);
                 break;
         }
     }
