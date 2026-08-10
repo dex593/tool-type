@@ -759,6 +759,9 @@ using PtsCancellationCallback = std::function<bool()>;
 using PtsPhotoshopRunningCallback = std::function<bool()>;
 using PtsSettingsRegistryUpdateCallback =
     std::function<uint32_t(const std::wstring&, const std::set<std::wstring>&)>;
+using PtsReplaceFileCallback =
+    std::function<BOOL(const std::wstring&, const std::wstring&,
+                       const std::wstring&, DWORD)>;
 
 struct PtsCancellationState {
     std::atomic_bool requested{false};
@@ -1901,26 +1904,69 @@ HANDLE CreateTemporarySiblingFile(const std::wstring& path, DWORD desiredAccess,
     return INVALID_HANDLE_VALUE;
 }
 
+void ClearTemporaryFileAttribute(const std::wstring& path) {
+    DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_TEMPORARY)) {
+        SetFileAttributesW(path.c_str(), attributes & ~FILE_ATTRIBUTE_TEMPORARY);
+    }
+}
+
+bool RestoreReplacementBackup(const std::wstring& path, const std::wstring& backupPath) {
+    if (!FileExists(backupPath)) return FileExists(path);
+    if (MoveFileExW(backupPath.c_str(), path.c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        return true;
+    }
+
+    if (!CopyFileW(backupPath.c_str(), path.c_str(), FALSE)) return false;
+    HANDLE restored = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (restored != INVALID_HANDLE_VALUE) {
+        FlushFileBuffers(restored);
+        CloseHandle(restored);
+    }
+    DeleteFileW(backupPath.c_str());
+    return true;
+}
+
 bool CommitTemporarySiblingFile(const std::wstring& path, const std::wstring& tempPath,
-                                DWORD& errorCode) {
+                                DWORD& errorCode,
+                                const PtsReplaceFileCallback& replaceFile = {}) {
     DWORD attrs = GetFileAttributesW(path.c_str());
     bool destinationExists = attrs != INVALID_FILE_ATTRIBUTES;
     bool clearedReadOnly = destinationExists && !(attrs & FILE_ATTRIBUTE_DIRECTORY) &&
                            (attrs & FILE_ATTRIBUTE_READONLY);
     if (clearedReadOnly) SetFileAttributesW(path.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
 
-    bool replaced = false;
-    if (destinationExists && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-        replaced = ReplaceFileW(path.c_str(), tempPath.c_str(), nullptr,
-                                REPLACEFILE_IGNORE_MERGE_ERRORS, nullptr, nullptr) != FALSE;
+    if (!destinationExists) {
+        if (MoveFileExW(tempPath.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH)) {
+            ClearTemporaryFileAttribute(path);
+            return true;
+        }
+        errorCode = GetLastError();
+        return false;
     }
-    if (!replaced) {
-        replaced = MoveFileExW(tempPath.c_str(), path.c_str(),
-                               MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+    if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+        errorCode = ERROR_ACCESS_DENIED;
+        return false;
     }
-    if (replaced) return true;
+
+    const std::wstring backupPath = tempPath + L".previous";
+    BOOL replaced = replaceFile
+                        ? replaceFile(path, tempPath, backupPath,
+                                      REPLACEFILE_IGNORE_MERGE_ERRORS)
+                        : ReplaceFileW(path.c_str(), tempPath.c_str(), backupPath.c_str(),
+                                       REPLACEFILE_IGNORE_MERGE_ERRORS, nullptr, nullptr);
+    if (replaced) {
+        DeleteFileW(backupPath.c_str());
+        ClearTemporaryFileAttribute(path);
+        return true;
+    }
 
     errorCode = GetLastError();
+    if (FileExists(backupPath)) {
+        RestoreReplacementBackup(path, backupPath);
+    }
     if (clearedReadOnly) SetFileAttributesW(path.c_str(), attrs);
     return false;
 }
