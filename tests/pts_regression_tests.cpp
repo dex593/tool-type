@@ -242,6 +242,30 @@ void TestAtomicCommitPreservesDestinationAcrossReplaceFailures() {
     Expect(read(replacement1177) == "new-1177",
            "1177 ReplaceFile failure destroyed the staged replacement");
 
+    fs::path staleDestination = root / L"destination-stale.afang";
+    fs::path staleReplacement = root / L"replacement-stale.tmp";
+    fs::path staleSafetyCopy = fs::path(staleReplacement.wstring() + L".previous");
+    write(staleDestination, "current-destination");
+    write(staleReplacement, "new-staged-data");
+    write(staleSafetyCopy, "unrelated-stale-safety-copy");
+    bool replaceWasCalled = false;
+    PtsReplaceFileCallback unexpectedReplace =
+        [&](const std::wstring&, const std::wstring&, const std::wstring&, DWORD) {
+            replaceWasCalled = true;
+            SetLastError(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2);
+            return FALSE;
+        };
+    errorCode = ERROR_SUCCESS;
+    Expect(!CommitTemporarySiblingFile(staleDestination.wstring(),
+                                       staleReplacement.wstring(), errorCode,
+                                       unexpectedReplace),
+           "atomic commit used a preexisting safety-backup path");
+    Expect(!replaceWasCalled, "ReplaceFile ran with a stale safety-backup path");
+    Expect(read(staleDestination) == "current-destination",
+           "stale safety backup overwrote the current destination");
+    Expect(read(staleSafetyCopy) == "unrelated-stale-safety-copy",
+           "atomic commit modified an unrelated stale safety backup");
+
     fs::path newDestination = root / L"new.afang";
     fs::path temporary = root / L"new.tmp";
     HANDLE temporaryFile = CreateFileW(temporary.wstring().c_str(), GENERIC_WRITE, 0, nullptr,
