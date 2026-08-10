@@ -44,16 +44,11 @@ bool IsNumericSeparator(wchar_t ch) {
     return ch == L',' || ch == L'.' || ch == L':';
 }
 
-bool IsEllipsisPeriod(const std::wstring& text, size_t index) {
-    if (index >= text.size() || text[index] != L'.') return false;
-
-    size_t first = index;
-    while (first > 0 && text[first - 1] == L'.') --first;
-
-    size_t last = index + 1;
-    while (last < text.size() && text[last] == L'.') ++last;
-
-    return last - first >= 3;
+bool EndsEllipsisRun(const std::wstring& text, size_t index) {
+    return index >= 2 &&
+           text[index] == L'.' &&
+           text[index - 1] == L'.' &&
+           text[index - 2] == L'.';
 }
 
 std::wstring CollapseWhitespace(const std::wstring& text) {
@@ -95,7 +90,7 @@ std::wstring NormalizeSpacesAfterPunctuation(const std::wstring& text) {
         out.push_back(ch);
 
         if (!IsSentencePunctuation(ch)) continue;
-        if (IsEllipsisPeriod(text, i)) continue;
+        if (EndsEllipsisRun(text, i)) continue;
 
         wchar_t previous = out.size() >= 2 ? out[out.size() - 2] : L'\0';
         size_t next = i + 1;

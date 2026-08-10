@@ -31,6 +31,10 @@ jobs:
         run: |
           "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
+      - name: Test text normalization
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File .\tests\run-tests.ps1 -Coverage
+
       - name: Build
         shell: pwsh
         env:

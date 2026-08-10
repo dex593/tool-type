@@ -59,6 +59,13 @@ int main() {
         ++failures;
     }
 
+    std::wstring longEllipsisRun(100000, L'.');
+    longEllipsisRun += L"hôm";
+    if (NormalizePasteText(longEllipsisRun) != longEllipsisRun) {
+        std::cerr << "FAIL: long ellipsis run remains unchanged\n";
+        ++failures;
+    }
+
     if (failures != 0) {
         std::cerr << failures << " normalization test(s) failed.\n";
         return 1;
