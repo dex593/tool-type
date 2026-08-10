@@ -150,6 +150,92 @@ void Expect(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+bool RectanglesOverlap(const RECT& first, const RECT& second) {
+    return first.left < second.right && first.right > second.left &&
+           first.top < second.bottom && first.bottom > second.top;
+}
+
+void ExpectRectScalesFrom96Dpi(const RECT& baseline, const RECT& scaled, UINT dpi,
+                               const char* message) {
+    Expect(scaled.left == ScalePtsMetric(baseline.left, dpi) &&
+               scaled.top == ScalePtsMetric(baseline.top, dpi) &&
+               scaled.right == ScalePtsMetric(baseline.right, dpi) &&
+               scaled.bottom == ScalePtsMetric(baseline.bottom, dpi),
+           message);
+}
+
+void TestPtsPopupLayoutIsOpaqueReadableAndDpiScaled() {
+    DWORD regularStyle = PtsDialogExtendedStyle(false);
+    DWORD topMostStyle = PtsDialogExtendedStyle(true);
+    Expect((regularStyle & WS_EX_LAYERED) == 0,
+           "Pts popup still lets controls from the owner bleed through");
+    Expect((regularStyle & WS_EX_TOPMOST) == 0 &&
+               (topMostStyle & WS_EX_TOPMOST) != 0,
+           "Pts popup top-most style no longer follows the user setting");
+
+    const PtsDialogLayout baseline = CalculatePtsDialogLayout(96);
+    for (UINT dpi : {96u, 120u, 144u, 192u}) {
+        const PtsDialogLayout layout = CalculatePtsDialogLayout(dpi);
+        Expect(layout.clientWidth == ScalePtsMetric(baseline.clientWidth, dpi) &&
+                   layout.clientHeight == ScalePtsMetric(baseline.clientHeight, dpi),
+               "Pts popup client size is not DPI-scaled");
+        ExpectRectScalesFrom96Dpi(baseline.title, layout.title, dpi,
+                                  "Pts title rect is not DPI-scaled");
+        ExpectRectScalesFrom96Dpi(baseline.backupSettings, layout.backupSettings, dpi,
+                                  "Pts backup-settings rect is not DPI-scaled");
+        ExpectRectScalesFrom96Dpi(baseline.backupFonts, layout.backupFonts, dpi,
+                                  "Pts backup-fonts rect is not DPI-scaled");
+        ExpectRectScalesFrom96Dpi(baseline.backupAll, layout.backupAll, dpi,
+                                  "Pts backup-all rect is not DPI-scaled");
+        ExpectRectScalesFrom96Dpi(baseline.restore, layout.restore, dpi,
+                                  "Pts restore rect is not DPI-scaled");
+        ExpectRectScalesFrom96Dpi(baseline.status, layout.status, dpi,
+                                  "Pts status rect is not DPI-scaled");
+        ExpectRectScalesFrom96Dpi(baseline.percent, layout.percent, dpi,
+                                  "Pts percent rect is not DPI-scaled");
+        ExpectRectScalesFrom96Dpi(baseline.progress, layout.progress, dpi,
+                                  "Pts progress rect is not DPI-scaled");
+        ExpectRectScalesFrom96Dpi(baseline.close, layout.close, dpi,
+                                  "Pts close rect is not DPI-scaled");
+
+        const int minimumGap = ScalePtsMetric(8, dpi);
+        const int outerMargin = ScalePtsMetric(18, dpi);
+        Expect(layout.backupAll.bottom + minimumGap <= layout.status.top &&
+                   layout.restore.bottom + minimumGap <= layout.status.top,
+               "Pts status is pressed against the action buttons");
+        Expect(layout.status.bottom + minimumGap <= layout.progress.top,
+               "Pts status overlaps or crowds the progress bar");
+        Expect(layout.status.right + minimumGap <= layout.percent.left &&
+                   layout.percent.top == layout.status.top &&
+                   layout.percent.bottom + minimumGap <= layout.progress.top,
+               "Pts percent is not in a separate aligned status column");
+        Expect(layout.progress.bottom + ScalePtsMetric(18, dpi) <= layout.close.top,
+               "Pts close button is pressed against the progress bar");
+        Expect(layout.close.bottom + outerMargin <= layout.clientHeight,
+               "Pts close button does not fit inside the client area");
+        Expect(layout.status.bottom - layout.status.top >= ScalePtsMetric(48, dpi),
+               "Pts status cannot display two Vietnamese lines without clipping");
+
+        Expect(!RectanglesOverlap(layout.backupSettings, layout.backupFonts) &&
+                   !RectanglesOverlap(layout.backupAll, layout.restore) &&
+                   !RectanglesOverlap(layout.status, layout.percent) &&
+                   !RectanglesOverlap(layout.status, layout.progress) &&
+                   !RectanglesOverlap(layout.percent, layout.progress) &&
+                   !RectanglesOverlap(layout.progress, layout.close),
+               "Pts popup controls overlap");
+    }
+}
+
+void TestCompactPtsNoticeMarksOmittedDetails() {
+    std::wstring notice = CompactPtsNotice(
+        L"Dòng đầu tiên chứa thông tin trạng thái cần hiển thị rõ ràng. "
+        L"Dòng thứ hai vẫn còn nội dung và phần chi tiết cuối không được biến mất im lặng.");
+    Expect(std::count(notice.begin(), notice.end(), L'\n') == 1,
+           "Pts compact notice no longer uses two visible lines");
+    Expect(notice.size() >= 3 && notice.substr(notice.size() - 3) == L"...",
+           "Pts compact notice silently omitted remaining details");
+}
+
 void TestPtsDialogLoopPreservesQuitAndDestroysWindow() {
     HWND window = CreateWindowExW(0, L"STATIC", L"Pts loop probe", WS_POPUP,
                                   0, 0, 10, 10, nullptr, nullptr,
@@ -650,6 +736,8 @@ void TestCrossVersionArchiveRestore() {
            "cross-version archive restore failed");
     Expect(registryUpdateRequested,
            "cross-version restore did not request the active Photoshop settings path update");
+    Expect(summary.find(L"SettingsFilePath") != std::wstring::npos,
+           "restore summary discarded details needed by the completion dialog");
 
     fs::path primary = settingsRoot / L"WorkSpaces" / L"Editing.psw";
     fs::path modified = settingsRoot / L"WorkSpaces (Modified)" / L"Editing.psw";
@@ -1289,6 +1377,8 @@ void TestCancelledRestoreStopsBeforeNextFile() {
            "restore wrote another file after cancellation was requested");
     Expect(LowerWide(error).find(L"hủy") != std::wstring::npos,
            "cancelled restore did not return a cancellation message");
+    Expect(LowerWide(error).find(L"không tự hoàn tác") != std::wstring::npos,
+           "partial restore cancellation misleadingly implied rollback or consistency");
     fs::remove_all(root, ignored);
 }
 
@@ -1459,6 +1549,8 @@ void TestIncompatibleCs6WorkspaceFailsInsteadOfClaimingSuccess() {
 
 int main() {
     try {
+        TestPtsPopupLayoutIsOpaqueReadableAndDpiScaled();
+        TestCompactPtsNoticeMarksOmittedDetails();
         TestSafeArchivePaths();
         TestCompressionRoundTrip();
         TestArchiveInspectionReportsProgress();
