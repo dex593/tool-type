@@ -531,6 +531,105 @@ void TestSettingsBackupArchive() {
     fs::remove_all(root, ignored);
 }
 
+void TestCancelledBackupDeletesIncompleteArchive() {
+    namespace fs = std::filesystem;
+    fs::path root = fs::temp_directory_path() / L"tooltype-pts-cancelled-backup";
+    std::error_code ignored;
+    fs::remove_all(root, ignored);
+    fs::path appDataRoot = root / L"Roaming";
+    fs::path localRoot = root / L"Local";
+    fs::path programFiles = root / L"ProgramFiles";
+    fs::path install = programFiles / L"Adobe" / L"Adobe Photoshop 2025";
+    fs::path settings = appDataRoot / L"Adobe" / L"Adobe Photoshop 2025" /
+                        L"Adobe Photoshop 2025 Settings";
+    fs::create_directories(install);
+    fs::create_directories(settings);
+    {
+        std::ofstream photoshop(install / L"Photoshop.exe", std::ios::binary);
+        photoshop << "test";
+        std::ofstream preference(settings / L"Adobe Photoshop 2025 Prefs.psp",
+                                 std::ios::binary);
+        preference << std::string(1024, 'P');
+    }
+
+    ScopedEnvironmentVariable appData(L"APPDATA", appDataRoot.wstring());
+    ScopedEnvironmentVariable localAppData(L"LOCALAPPDATA", localRoot.wstring());
+    ScopedEnvironmentVariable pf(L"ProgramFiles", programFiles.wstring());
+    ScopedEnvironmentVariable pf32(L"ProgramFiles(x86)", programFiles.wstring());
+    ScopedEnvironmentVariable pf64(L"ProgramW6432", programFiles.wstring());
+
+    auto versions = DiscoverPhotoshopVersions();
+    auto version = std::find_if(versions.begin(), versions.end(), [](const auto& candidate) {
+        return LowerWide(candidate.label) == L"adobe photoshop 2025";
+    });
+    Expect(version != versions.end(), "cancelled backup Photoshop version was not discovered");
+    PtsBackupOptions options{};
+    options.selectedPhotoshopVersionLabel = version->label;
+    options.selectedPhotoshopVersionLabels.insert(LowerWide(version->label));
+    for (const auto& rootItem : version->roots) {
+        options.selectedPhotoshopVersionKeys.insert(rootItem.versionKey);
+    }
+
+    bool cancelNow = false;
+    auto progress = [&](int percent, const std::wstring&) {
+        if (percent >= 20) cancelNow = true;
+    };
+    PtsCancellationCallback cancelled = [&] { return cancelNow; };
+    fs::path archive = root / L"cancelled.afang";
+    std::wstring summary;
+    std::wstring error;
+    Expect(!CreatePtsBackupArchive(archive.wstring(), true, false, options, progress,
+                                   summary, error, cancelled),
+           "cancelled backup incorrectly reported success");
+    Expect(!fs::exists(archive), "cancelled backup left an incomplete .afang file");
+    Expect(LowerWide(error).find(L"hủy") != std::wstring::npos,
+           "cancelled backup did not return a cancellation message");
+    fs::remove_all(root, ignored);
+}
+
+void TestCancelledRestoreStopsBeforeNextFile() {
+    namespace fs = std::filesystem;
+    fs::path root = fs::temp_directory_path() / L"tooltype-pts-cancelled-restore";
+    std::error_code ignored;
+    fs::remove_all(root, ignored);
+    fs::create_directories(root / L"Roaming");
+    fs::create_directories(root / L"Local");
+    ScopedEnvironmentVariable appData(L"APPDATA", (root / L"Roaming").wstring());
+    ScopedEnvironmentVariable localAppData(L"LOCALAPPDATA", (root / L"Local").wstring());
+
+    const std::wstring settingsRoot =
+        L"Adobe\\Adobe Photoshop 2025\\Adobe Photoshop 2025 Settings\\";
+    TestArchiveEntry first{PtsEntryKind::PhotoshopSetting, L"APPDATA",
+                           settingsRoot + L"First.psp", L"Adobe Photoshop 2025",
+                           std::vector<uint8_t>{1, 2, 3}};
+    TestArchiveEntry second{PtsEntryKind::PhotoshopSetting, L"APPDATA",
+                            settingsRoot + L"Second.psp", L"Adobe Photoshop 2025",
+                            std::vector<uint8_t>{4, 5, 6}};
+    fs::path archive = root / L"restore.afang";
+    WriteTestArchive(archive.wstring(), {first, second});
+
+    bool cancelNow = false;
+    auto progress = [&](int, const std::wstring& message) {
+        if (message.find(L"Đang restore file 2/2") != std::wstring::npos) cancelNow = true;
+    };
+    PtsCancellationCallback cancelled = [&] { return cancelNow; };
+    PtsRestoreOptions options{};
+    std::wstring summary;
+    std::wstring error;
+    Expect(!RestorePtsBackupArchive(archive.wstring(), options, progress, summary, error,
+                                    cancelled),
+           "cancelled restore incorrectly reported success");
+    fs::path restoredRoot = root / L"Roaming" / L"Adobe" / L"Adobe Photoshop 2025" /
+                            L"Adobe Photoshop 2025 Settings";
+    Expect(fs::exists(restoredRoot / L"First.psp"),
+           "restore cancellation happened before the completed first file");
+    Expect(!fs::exists(restoredRoot / L"Second.psp"),
+           "restore wrote another file after cancellation was requested");
+    Expect(LowerWide(error).find(L"hủy") != std::wstring::npos,
+           "cancelled restore did not return a cancellation message");
+    fs::remove_all(root, ignored);
+}
+
 void TestIdenticalFontRestoreIsSkipped() {
     namespace fs = std::filesystem;
     fs::path root = fs::temp_directory_path() / L"tooltype-pts-identical-font";
@@ -706,6 +805,8 @@ int main() {
         TestCrossVersionMappingAndCs6Aliases();
         TestFontCollisionPath();
         TestSettingsBackupArchive();
+        TestCancelledBackupDeletesIncompleteArchive();
+        TestCancelledRestoreStopsBeforeNextFile();
         TestCrossVersionArchiveRestore();
         TestIdenticalFontRestoreIsSkipped();
         TestMalformedArchiveDoesNotWriteAnything();
