@@ -34,6 +34,7 @@
 - Commit `2eb9674` reproduced the real-machine failure residue: a stale `WorkSpaces\Essentials` alias with a duplicated closing root/trailing XML survived restore and remained available for CS6 to load.
 - Commit `4ac1273` expanded that RED contract to prefix garbage, mismatched inner tags, XML comments containing tag-like text, and preservation of a valid unplanned counterpart.
 - Commit `59977c1` reproduced the popup defects from the screenshot: the intended Pts modal style/layout APIs did not exist, the popup remained translucent, status spacing was too tight, long live notices discarded their tail silently, completion details were compacted, and partial-cancel wording implied a safer outcome than the non-transactional restore provides.
+- Commit `3b20596` added follow-up RED coverage for DPI-scaled dialog fonts, a fully visible non-rollback warning, and cancellation after an identical font was skipped without mutating the machine.
 
 ## GREEN implementation
 
@@ -60,6 +61,7 @@
 - Commit `a1379b9` makes both Pts dialogs opaque, introduces one DPI-scaled `520x330` logical layout with dedicated status/percentage/progress regions, clamps dialogs to the monitor work area, and visibly dims disabled owner-drawn buttons.
 - Pts actions and progress messages now use consistent Vietnamese labels. Starting a new workflow resets stale progress, partial cancellation keeps the reached percentage and explicitly says applied changes are not rolled back, while full details remain available in the completion/error dialog.
 - `CompactPtsNotice` still limits the live popup to two short lines, but now appends `...` whenever details are omitted instead of silently hiding them.
+- Commit `08a642a` scales the actual Segoe UI font with the Pts layout, keeps the full “không tự hoàn tác” warning inside two visible lines, and reports “chưa có thay đổi” when cancellation follows only no-op/identical font entries. File writes, font registration, and Registry updates now set the operation mutation state explicitly.
 
 ## Regression specification
 
@@ -89,9 +91,10 @@
 | Malformed archives perform no writes | `TestMalformedArchiveDoesNotWriteAnything` | PASS |
 | Failed destination replacement preserves original bytes | `TestAtomicRestoreWritePreservesLockedDestination` | PASS |
 | Incompatible CS6 workspace data fails without a raw write | `TestIncompatibleCs6WorkspaceFailsInsteadOfClaimingSuccess` | PASS |
-| Pts popup is opaque and every control stays separated/scaled at 96/120/144/192 DPI | `TestPtsPopupLayoutIsOpaqueReadableAndDpiScaled` | PASS |
+| Pts popup is opaque; every control and its font stay separated/scaled at 96/120/144/192 DPI | `TestPtsPopupLayoutIsOpaqueReadableAndDpiScaled` | PASS |
 | Live notices mark omitted content and full restore summaries reach the completion dialog | `TestCompactPtsNoticeMarksOmittedDetails`, summary assertion in `TestCrossVersionArchiveRestore` | PASS |
 | Partial restore cancellation states that applied changes are not automatically rolled back | `TestCancelledRestoreStopsBeforeNextFile` | PASS |
+| Cancelling after only an identical font no-op reports that no change was applied | `TestIdenticalFontRestoreIsSkipped` | PASS |
 
 Registry-mutating tests use scoped cleanup so their HKCU values are removed even when an assertion throws.
 
@@ -100,6 +103,7 @@ Registry-mutating tests use scoped cleanup so their HKCU values are removed even
 - `powershell -ExecutionPolicy Bypass -File .\tests\run-tests.ps1` — normalization and Pts suites passed.
 - `powershell -ExecutionPolicy Bypass -File .\tests\run-tests.ps1 -Coverage` — suites passed; the extracted normalization module reported **94.85% line coverage**, **100% branches executed**, and **82% branches taken at least once**.
 - The production `build.ps1` linked `ToolType.exe` successfully with `-Wall -Wextra -Wpedantic` and no warnings.
+- A Win32 smoke launch opened the production Pts popup at `526x359` outer pixels on the 96-DPI test desktop. The captured popup was opaque, showed no owner controls through its client area, and kept actions, status/percentage, progress bar, and close button visibly separated.
 - `git diff --check` and PowerShell parser checks — passed.
 
 Coverage percentages above apply to `text_normalization.cpp`; the Pts suite is a native Win32 regression/integration suite and does not claim a separate line-coverage percentage. Real-machine performance still depends on archive size, storage, antivirus scanning, and the number of installed fonts. A single blocking Windows/font API call cannot be interrupted internally, so `Hủy` takes effect immediately after that safe call returns; the UI thread itself remains available because the call runs on the worker.
