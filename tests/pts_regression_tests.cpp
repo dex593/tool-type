@@ -714,6 +714,72 @@ void TestSameVersionWorkspaceRestoreKeepsDistinctVariants() {
     fs::remove_all(root, ignored);
 }
 
+void TestCrossVersionWorkspaceAliasesDoNotOverwritePrimaryEntries() {
+    namespace fs = std::filesystem;
+    fs::path root = fs::temp_directory_path() / L"tooltype-pts-cross-version-workspaces";
+    std::error_code ignored;
+    fs::remove_all(root, ignored);
+    fs::create_directories(root / L"Roaming");
+    fs::create_directories(root / L"Local");
+    ScopedEnvironmentVariable appData(L"APPDATA", (root / L"Roaming").wstring());
+    ScopedEnvironmentVariable localAppData(L"LOCALAPPDATA", (root / L"Local").wstring());
+
+    const std::string primaryXml =
+        "<photoshop-workspace version=\"2.0\"><frame name=\"primary-modern\"/>"
+        "</photoshop-workspace>";
+    const std::string modifiedXml =
+        "<photoshop-workspace version=\"2.0\"><frame name=\"modified-modern\"/>"
+        "</photoshop-workspace>";
+    const std::wstring sourceSettings =
+        L"Adobe\\Adobe Photoshop 2025\\Adobe Photoshop 2025 Settings\\";
+    TestArchiveEntry primary{
+        PtsEntryKind::PhotoshopSetting, L"APPDATA",
+        sourceSettings + L"WorkSpaces\\Editing.psw", L"Adobe Photoshop 2025",
+        std::vector<uint8_t>(primaryXml.begin(), primaryXml.end())};
+    TestArchiveEntry modified{
+        PtsEntryKind::PhotoshopSetting, L"APPDATA",
+        sourceSettings + L"WorkSpaces (Modified)\\Editing.psw",
+        L"Adobe Photoshop 2025",
+        std::vector<uint8_t>(modifiedXml.begin(), modifiedXml.end())};
+    fs::path archive = root / L"cross-version-variants.afang";
+    WriteTestArchive(archive.wstring(), {primary, modified});
+
+    PtsRestoreOptions options{};
+    options.sourceVersionLabel = L"Adobe Photoshop 2025";
+    options.targetVersionLabel = L"Adobe Photoshop CS6";
+    options.targetAppDataRelativeRoot = L"Adobe\\Adobe Photoshop CS6";
+    options.targetLocalAppDataRelativeRoot = L"Adobe\\Adobe Photoshop CS6";
+    options.archiveHasSettings = true;
+    std::wstring summary;
+    std::wstring error;
+    auto progress = [](int, const std::wstring&) {};
+    auto registryUpdater = [](const std::wstring&, const std::set<std::wstring>&) {
+        return 1u;
+    };
+    Expect(RestorePtsBackupArchive(archive.wstring(), options, progress, summary, error,
+                                   PtsCancellationCallback{}, registryUpdater),
+           "cross-version workspace variants restore failed");
+
+    fs::path restoredSettings = root / L"Roaming" / L"Adobe" /
+                                L"Adobe Photoshop CS6" /
+                                L"Adobe Photoshop CS6 Settings";
+    std::ifstream primaryFile(restoredSettings / L"WorkSpaces" / L"Editing.psw",
+                              std::ios::binary);
+    std::string primaryBytes((std::istreambuf_iterator<char>(primaryFile)),
+                             std::istreambuf_iterator<char>());
+    std::ifstream modifiedFile(
+        restoredSettings / L"WorkSpaces (Modified)" / L"Editing.psw", std::ios::binary);
+    std::string modifiedBytes((std::istreambuf_iterator<char>(modifiedFile)),
+                              std::istreambuf_iterator<char>());
+    Expect(primaryBytes.find("primary-modern") != std::string::npos,
+           "cross-version alias overwrote the primary WorkSpaces entry");
+    Expect(modifiedBytes.find("modified-modern") != std::string::npos,
+           "cross-version alias overwrote the primary Modified entry");
+    primaryFile.close();
+    modifiedFile.close();
+    fs::remove_all(root, ignored);
+}
+
 void TestSettingsBackupArchive() {
     namespace fs = std::filesystem;
     fs::path root = fs::temp_directory_path() / L"tooltype-pts-settings-backup";
@@ -1165,6 +1231,7 @@ int main() {
         TestCancelledRestoreStopsBeforeNextFile();
         TestCrossVersionArchiveRestore();
         TestSameVersionWorkspaceRestoreKeepsDistinctVariants();
+        TestCrossVersionWorkspaceAliasesDoNotOverwritePrimaryEntries();
         TestIdenticalFontRestoreIsSkipped();
         TestMalformedArchiveDoesNotWriteAnything();
         TestAtomicRestoreWritePreservesLockedDestination();
