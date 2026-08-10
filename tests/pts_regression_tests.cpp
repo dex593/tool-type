@@ -176,6 +176,8 @@ void TestPtsPopupLayoutIsOpaqueReadableAndDpiScaled() {
     const PtsDialogLayout baseline = CalculatePtsDialogLayout(96);
     for (UINT dpi : {96u, 120u, 144u, 192u}) {
         const PtsDialogLayout layout = CalculatePtsDialogLayout(dpi);
+        Expect(PtsDialogFontHeight(dpi) == -ScalePtsMetric(13, dpi),
+               "Pts popup font is not DPI-scaled with its layout");
         Expect(layout.clientWidth == ScalePtsMetric(baseline.clientWidth, dpi) &&
                    layout.clientHeight == ScalePtsMetric(baseline.clientHeight, dpi),
                "Pts popup client size is not DPI-scaled");
@@ -234,6 +236,11 @@ void TestCompactPtsNoticeMarksOmittedDetails() {
            "Pts compact notice no longer uses two visible lines");
     Expect(notice.size() >= 3 && notice.substr(notice.size() - 3) == L"...",
            "Pts compact notice silently omitted remaining details");
+
+    std::wstring partialCancellation = CompactPtsNotice(
+        L"Đã hủy khôi phục giữa chừng. Một phần thay đổi đã được áp dụng và không tự hoàn tác.");
+    Expect(LowerWide(partialCancellation).find(L"không tự hoàn tác") != std::wstring::npos,
+           "Pts popup hid the non-rollback warning after a partial restore");
 }
 
 void TestPtsDialogLoopPreservesQuitAndDestroysWindow() {
@@ -1445,6 +1452,21 @@ void TestIdenticalFontRestoreIsSkipped() {
     std::wstring restoredMapping;
     Expect(ReadRegistryStringValue(registry.Get(), alternateName.c_str(), restoredMapping),
            "font restore did not create a collision-safe Registry value");
+
+    bool cancelBeforeRegistration = false;
+    auto cancelProgress = [&](int, const std::wstring& message) {
+        if (message.find(L"Đang đăng ký font") != std::wstring::npos) {
+            cancelBeforeRegistration = true;
+        }
+    };
+    auto cancelled = [&] { return cancelBeforeRegistration; };
+    summary.clear();
+    error.clear();
+    Expect(!RestorePtsBackupArchive(archive.wstring(), options, cancelProgress, summary, error,
+                                    cancelled),
+           "font-only restore ignored cancellation before registration");
+    Expect(LowerWide(error).find(L"chưa có thay đổi") != std::wstring::npos,
+           "skipping an identical font was incorrectly reported as an applied change");
     fs::remove_all(root, ignored);
 }
 
