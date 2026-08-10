@@ -3770,25 +3770,115 @@ bool IsWorkspaceTargetPath(const std::wstring& targetPath) {
            file.find(L"workspace prefs") != std::wstring::npos;
 }
 
+bool IsWorkspaceXmlNameChar(wchar_t ch) {
+    return iswalnum(ch) || ch == L'_' || ch == L'-' || ch == L':' || ch == L'.';
+}
+
+bool IsWorkspaceXmlOuterPadding(wchar_t ch) {
+    return iswspace(ch) || ch == L'\0' || ch == 0xFEFF;
+}
+
 bool IsStrictStandalonePhotoshopWorkspaceBytes(const std::vector<uint8_t>& raw) {
     std::wstring text = DecodeTextBytes(raw);
-    const std::wstring openTag = L"<photoshop-workspace";
-    const std::wstring closeTag = L"</photoshop-workspace>";
-    size_t open = text.find(openTag);
-    if (open == std::wstring::npos ||
-        text.find(openTag, open + openTag.size()) != std::wstring::npos) {
-        return false;
+    std::vector<std::wstring> elements;
+    bool sawRoot = false;
+    bool rootClosed = false;
+    bool sawWorkspace = false;
+    size_t pos = 0;
+
+    while (pos < text.size()) {
+        if (text[pos] != L'<') {
+            size_t next = text.find(L'<', pos);
+            if (next == std::wstring::npos) next = text.size();
+            if (elements.empty()) {
+                for (size_t i = pos; i < next; ++i) {
+                    if (!IsWorkspaceXmlOuterPadding(text[i])) return false;
+                }
+            }
+            pos = next;
+            continue;
+        }
+
+        if (text.compare(pos, 4, L"<!--") == 0) {
+            size_t end = text.find(L"-->", pos + 4);
+            if (end == std::wstring::npos) return false;
+            pos = end + 3;
+            continue;
+        }
+        if (text.compare(pos, 2, L"<?") == 0) {
+            size_t end = text.find(L"?>", pos + 2);
+            if (end == std::wstring::npos) return false;
+            pos = end + 2;
+            continue;
+        }
+        if (text.compare(pos, 9, L"<![CDATA[") == 0) {
+            if (elements.empty()) return false;
+            size_t end = text.find(L"]]>", pos + 9);
+            if (end == std::wstring::npos) return false;
+            pos = end + 3;
+            continue;
+        }
+        if (text.compare(pos, 2, L"<!") == 0) return false;
+
+        const bool closing = text.compare(pos, 2, L"</") == 0;
+        size_t nameStart = pos + (closing ? 2 : 1);
+        size_t nameEnd = nameStart;
+        while (nameEnd < text.size() && IsWorkspaceXmlNameChar(text[nameEnd])) ++nameEnd;
+        if (nameEnd == nameStart) return false;
+        std::wstring name = text.substr(nameStart, nameEnd - nameStart);
+
+        if (closing) {
+            size_t end = nameEnd;
+            while (end < text.size() && iswspace(text[end])) ++end;
+            if (end >= text.size() || text[end] != L'>' || elements.empty() ||
+                elements.back() != name) {
+                return false;
+            }
+            elements.pop_back();
+            pos = end + 1;
+            if (elements.empty()) rootClosed = true;
+            continue;
+        }
+
+        if (rootClosed) return false;
+        wchar_t quote = L'\0';
+        size_t end = nameEnd;
+        for (; end < text.size(); ++end) {
+            wchar_t ch = text[end];
+            if (quote != L'\0') {
+                if (ch == quote) quote = L'\0';
+                continue;
+            }
+            if (ch == L'\'' || ch == L'"') {
+                quote = ch;
+            } else if (ch == L'>') {
+                break;
+            } else if (ch == L'<') {
+                return false;
+            }
+        }
+        if (end >= text.size() || quote != L'\0') return false;
+
+        size_t marker = end;
+        while (marker > nameEnd && iswspace(text[marker - 1])) --marker;
+        const bool selfClosing = marker > nameEnd && text[marker - 1] == L'/';
+        if (!sawRoot) {
+            if (name != L"photoshop-workspace") return false;
+            sawRoot = true;
+        } else if (elements.empty()) {
+            return false;
+        }
+        if (name == L"workspace") sawWorkspace = true;
+
+        if (!selfClosing) {
+            elements.push_back(std::move(name));
+        } else if (elements.empty()) {
+            rootClosed = true;
+        }
+        pos = end + 1;
     }
-    size_t close = text.find(closeTag, open + openTag.size());
-    if (close == std::wstring::npos ||
-        text.find(closeTag, close + closeTag.size()) != std::wstring::npos) {
-        return false;
-    }
-    size_t end = close + closeTag.size();
-    for (size_t i = end; i < text.size(); ++i) {
-        if (!iswspace(text[i]) && text[i] != L'\0') return false;
-    }
-    return true;
+
+    return sawRoot && rootClosed && sawWorkspace && elements.empty();
 }
 
 bool LooksLikeLegacyWorkspaceXml(const std::wstring& text) {
