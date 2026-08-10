@@ -7,6 +7,7 @@
 - Font restore must avoid redundant file writes and repeated `-restored-N` copies, register fonts for the current user, and keep the popup responsive during large scans/registration batches.
 - Backup/restore core work must run outside the UI thread, and the user must be able to cancel an active operation without terminating a thread unsafely.
 - Restore must reject malformed or unsafe paths, preserve an existing destination if a write fails, and never claim CS6 workspace success when conversion is incompatible.
+- A CS6-to-CS6 restore must preserve native workspace bytes and repair only a malformed legacy counterpart alias, without overwriting a valid distinct workspace.
 
 ## RED checkpoints
 
@@ -27,6 +28,8 @@
 - Commit `762f732` reproduced the equivalent cross-version corruption when two distinct source workspace variants generated aliases for each other's primary target.
 - Commit `4f6980b` showed that incremental alias protection was insufficient: cancelling before the later primary entry left the earlier alias in that future primary path.
 - Commit `f205161` reproduced a stale `.previous` safety-copy collision that could otherwise be mistaken for the current rollback file.
+- Commit `9b55986` proved that same-version CS6 restore still passed native workspace data through the compatibility normalizer instead of preserving the archive bytes.
+- Commit `2eb9674` reproduced the real-machine failure residue: a stale `WorkSpaces\Essentials` alias with a duplicated closing root/trailing XML survived restore and remained available for CS6 to load.
 
 ## GREEN implementation
 
@@ -46,6 +49,8 @@
 - Commit `b2248d0` tracks primary workspace destinations during cross-version restore; a compatibility alias can no longer overwrite a primary entry already restored from the archive.
 - Commit `e571385` performs a seek-based metadata planning pass before the first write, so aliases are also blocked from every future primary path during cancelled or failed partial restores.
 - Commit `d4f0a7b` aborts before `ReplaceFileW` when its safety-backup path already exists and reports the retained recovery path if rollback itself cannot complete.
+- Commit `e9fbc07` limits workspace-format conversion to an actual cross-version restore, keeping CS6-to-CS6 workspace payloads byte-for-byte.
+- Commit `71cf7ee` inspects legacy same-version counterpart aliases only when they are absent from the archive plan: valid existing workspaces are preserved, absent aliases are not created, and a malformed stale alias is atomically replaced with the restored valid workspace bytes.
 - Windows path validation rejects traversal, empty/dot segments, control characters, trailing dot/space, and reserved device prefixes before the first period.
 
 ## Regression specification
@@ -63,6 +68,8 @@
 | Cancelled restore stops before the next file and preserves a completed prior file | `TestCancelledRestoreStopsBeforeNextFile` | PASS |
 | Modern settings map to CS6 aliases/workspace layout | `TestCrossVersionMappingAndCs6Aliases`, `TestCrossVersionArchiveRestore` | PASS |
 | Same-version workspace variants keep their own bytes instead of overwriting through aliases | `TestSameVersionWorkspaceRestoreKeepsDistinctVariants` | PASS |
+| Native CS6-to-CS6 workspace payloads bypass cross-version normalization | `TestSameVersionCs6WorkspaceRestoreKeepsNativeBytes` | PASS |
+| A malformed legacy counterpart alias is repaired while archive-planned primary variants remain protected | `TestSameVersionCs6RestoreRepairsMalformedLegacyAlias` | PASS |
 | Cross-version workspace aliases cannot overwrite distinct primary workspace variants | `TestCrossVersionWorkspaceAliasesDoNotOverwritePrimaryEntries` | PASS |
 | Cancelled cross-version restore cannot leave an alias in a future primary workspace path | `TestCancelledCrossVersionRestoreDoesNotAliasOverFuturePrimary` | PASS |
 | Native restore tests request but do not write the real Photoshop Registry path | injected updater in `TestCrossVersionArchiveRestore` | PASS |
