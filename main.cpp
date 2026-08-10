@@ -2937,8 +2937,12 @@ std::vector<std::wstring> BuildPhotoshopSettingsRestoreRelativePaths(
     std::vector<std::wstring> paths;
     AddUniquePhotoshopRestoreRelativePath(paths, primaryPath);
 
-    if (ShouldRewritePhotoshopVersionLabel(sourceLabel, targetLabel)) {
+    const bool crossVersion =
+        ShouldRewritePhotoshopVersionLabel(sourceLabel, targetLabel);
+    if (crossVersion) {
         AddPhotoshopVersionFilenameAliases(paths, primaryPath, targetLabel);
+    }
+    if (crossVersion || UsesLegacyPhotoshopWorkspaceNames(targetLabel)) {
         AddWorkspaceCompatibilityAliases(paths, primaryPath, targetLabel);
     }
     return paths;
@@ -3766,6 +3770,27 @@ bool IsWorkspaceTargetPath(const std::wstring& targetPath) {
            file.find(L"workspace prefs") != std::wstring::npos;
 }
 
+bool IsStrictStandalonePhotoshopWorkspaceBytes(const std::vector<uint8_t>& raw) {
+    std::wstring text = DecodeTextBytes(raw);
+    const std::wstring openTag = L"<photoshop-workspace";
+    const std::wstring closeTag = L"</photoshop-workspace>";
+    size_t open = text.find(openTag);
+    if (open == std::wstring::npos ||
+        text.find(openTag, open + openTag.size()) != std::wstring::npos) {
+        return false;
+    }
+    size_t close = text.find(closeTag, open + openTag.size());
+    if (close == std::wstring::npos ||
+        text.find(closeTag, close + closeTag.size()) != std::wstring::npos) {
+        return false;
+    }
+    size_t end = close + closeTag.size();
+    for (size_t i = end; i < text.size(); ++i) {
+        if (!iswspace(text[i]) && text[i] != L'\0') return false;
+    }
+    return true;
+}
+
 bool LooksLikeLegacyWorkspaceXml(const std::wstring& text) {
     std::wstring lower = LowerWide(text);
     return lower.find(L"<photoshop-workspace version=\"1") != std::wstring::npos ||
@@ -4250,6 +4275,9 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
             return false;
         }
 
+        const bool crossVersionRestore =
+            ShouldRewritePhotoshopVersionLabel(sourceLabel,
+                                               options.targetVersionLabel);
         bool convertedWorkspaceForEntry = false;
         for (size_t pathIndex = 0; pathIndex < destinationRelativePaths.size(); ++pathIndex) {
             const auto& targetRelativePath = destinationRelativePaths[pathIndex];
@@ -4270,10 +4298,17 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
             }
             const std::wstring targetPath =
                 JoinPath(destinationBasePath, targetRelativePath);
+            if (pathIndex > 0 && !crossVersionRestore &&
+                UsesLegacyPhotoshopWorkspaceNames(options.targetVersionLabel)) {
+                std::vector<uint8_t> existingAlias;
+                std::wstring ignoredReadError;
+                if (!ReadFileBytes(targetPath, existingAlias, ignoredReadError) ||
+                    IsStrictStandalonePhotoshopWorkspaceBytes(existingAlias)) {
+                    continue;
+                }
+            }
             std::vector<uint8_t> bytesToWrite = raw;
-            if (options.HasTargetMapping() &&
-                ShouldRewritePhotoshopVersionLabel(sourceLabel,
-                                                   options.targetVersionLabel)) {
+            if (options.HasTargetMapping() && crossVersionRestore) {
                 std::vector<uint8_t> normalized;
                 WorkspaceCompatibilityResult compatibility =
                     PreparePhotoshopWorkspaceBytesForTarget(
