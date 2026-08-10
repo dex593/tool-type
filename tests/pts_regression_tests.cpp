@@ -791,6 +791,68 @@ void TestSameVersionCs6WorkspaceRestoreKeepsNativeBytes() {
     fs::remove_all(root, ignored);
 }
 
+void TestSameVersionCs6RestoreRepairsMalformedLegacyAlias() {
+    namespace fs = std::filesystem;
+    fs::path root = fs::temp_directory_path() / L"tooltype-pts-cs6-stale-alias";
+    std::error_code ignored;
+    fs::remove_all(root, ignored);
+    fs::path roaming = root / L"Roaming";
+    fs::path local = root / L"Local";
+    fs::create_directories(roaming);
+    fs::create_directories(local);
+    ScopedEnvironmentVariable appData(L"APPDATA", roaming.wstring());
+    ScopedEnvironmentVariable localAppData(L"LOCALAPPDATA", local.wstring());
+
+    const std::string archivedModified =
+        "<photoshop-workspace version=\"1.0\"><workspace version=\"1\">"
+        "<frame name=\"restored-layout\"/></workspace></photoshop-workspace>";
+    const std::string malformedStaleAlias =
+        "<photoshop-workspace version=\"1.0\"><workspace version=\"1\"/>"
+        "</photoshop-workspace>stale-tail</workspace></photoshop-workspace>";
+    const std::wstring settingsRoot =
+        L"Adobe\\Adobe Photoshop CS6\\Adobe Photoshop CS6 Settings\\";
+    fs::path settings = roaming / L"Adobe" / L"Adobe Photoshop CS6" /
+                        L"Adobe Photoshop CS6 Settings";
+    fs::path staleAlias = settings / L"WorkSpaces" / L"Essentials";
+    fs::create_directories(staleAlias.parent_path());
+    {
+        std::ofstream stale(staleAlias, std::ios::binary);
+        stale << malformedStaleAlias;
+    }
+
+    TestArchiveEntry modified{
+        PtsEntryKind::PhotoshopSetting, L"APPDATA",
+        settingsRoot + L"WorkSpaces (Modified)\\Essentials",
+        L"Adobe Photoshop CS6",
+        std::vector<uint8_t>(archivedModified.begin(), archivedModified.end())};
+    fs::path archive = root / L"stale-alias.afang";
+    WriteTestArchive(archive.wstring(), {modified});
+
+    PtsRestoreOptions options{};
+    options.sourceVersionLabel = L"Adobe Photoshop CS6";
+    options.targetVersionLabel = L"Adobe Photoshop CS6";
+    options.targetAppDataRelativeRoot = L"Adobe\\Adobe Photoshop CS6";
+    options.targetLocalAppDataRelativeRoot = L"Adobe\\Adobe Photoshop CS6";
+    options.archiveHasSettings = true;
+    std::wstring summary;
+    std::wstring error;
+    auto progress = [](int, const std::wstring&) {};
+    auto registryUpdater = [](const std::wstring&, const std::set<std::wstring>&) {
+        return 1u;
+    };
+    Expect(RestorePtsBackupArchive(archive.wstring(), options, progress, summary, error,
+                                   PtsCancellationCallback{}, registryUpdater),
+           "same-version CS6 stale-alias repair failed");
+
+    std::ifstream repaired(staleAlias, std::ios::binary);
+    std::string repairedBytes((std::istreambuf_iterator<char>(repaired)),
+                              std::istreambuf_iterator<char>());
+    repaired.close();
+    Expect(repairedBytes == archivedModified,
+           "malformed legacy workspace alias was left for CS6 to load");
+    fs::remove_all(root, ignored);
+}
+
 void TestCrossVersionWorkspaceAliasesDoNotOverwritePrimaryEntries() {
     namespace fs = std::filesystem;
     fs::path root = fs::temp_directory_path() / L"tooltype-pts-cross-version-workspaces";
@@ -1372,6 +1434,7 @@ int main() {
         TestCrossVersionArchiveRestore();
         TestSameVersionWorkspaceRestoreKeepsDistinctVariants();
         TestSameVersionCs6WorkspaceRestoreKeepsNativeBytes();
+        TestSameVersionCs6RestoreRepairsMalformedLegacyAlias();
         TestCrossVersionWorkspaceAliasesDoNotOverwritePrimaryEntries();
         TestCancelledCrossVersionRestoreDoesNotAliasOverFuturePrimary();
         TestIdenticalFontRestoreIsSkipped();
