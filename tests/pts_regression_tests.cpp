@@ -17,6 +17,61 @@ struct TestArchiveEntry {
     std::vector<uint8_t> data;
 };
 
+struct BackgroundUiProbe {
+    bool heartbeatReceived = false;
+    bool progressReceived = false;
+    bool completionReceived = false;
+    bool operationSucceeded = false;
+    DWORD workerThreadId = 0;
+};
+
+constexpr UINT kBackgroundUiHeartbeat = WM_APP + 120;
+
+LRESULT CALLBACK BackgroundUiProbeWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    auto* probe = reinterpret_cast<BackgroundUiProbe*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        probe = reinterpret_cast<BackgroundUiProbe*>(create->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(probe));
+    }
+    if (!probe) return DefWindowProcW(hwnd, message, wParam, lParam);
+
+    if (message == kBackgroundUiHeartbeat) {
+        probe->heartbeatReceived = true;
+        return 0;
+    }
+    if (message == WM_APP_PTS_PROGRESS) {
+        auto* progress = reinterpret_cast<PtsProgressMessage*>(lParam);
+        probe->progressReceived = progress && progress->percent == 42;
+        delete progress;
+        return 0;
+    }
+    if (message == WM_APP_PTS_OPERATION_DONE) {
+        auto* result = reinterpret_cast<PtsBackgroundResult*>(lParam);
+        if (result) {
+            probe->completionReceived = true;
+            probe->operationSucceeded = result->ok;
+            probe->workerThreadId = result->workerThreadId;
+        }
+        delete result;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+bool PumpMessagesUntil(const bool& condition, DWORD timeoutMs) {
+    ULONGLONG deadline = GetTickCount64() + timeoutMs;
+    while (!condition && GetTickCount64() < deadline) {
+        MSG message{};
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        Sleep(1);
+    }
+    return condition;
+}
+
 class ScopedEnvironmentVariable {
 public:
     ScopedEnvironmentVariable(const wchar_t* name, const std::wstring& value) : name_(name) {
@@ -174,6 +229,70 @@ void TestArchiveInspectionReportsProgress() {
     Expect(scan.entryCount == entries.size(), "archive inspection lost entries");
     Expect(callbackCount >= 3, "archive inspection did not report periodic progress");
     fs::remove_all(root, ignored);
+}
+
+void TestPtsBackgroundTaskKeepsUiThreadResponsive() {
+    const wchar_t* className = L"ToolTypePtsBackgroundUiProbe";
+    WNDCLASSW windowClass{};
+    windowClass.lpfnWndProc = BackgroundUiProbeWndProc;
+    windowClass.hInstance = GetModuleHandleW(nullptr);
+    windowClass.lpszClassName = className;
+    ATOM atom = RegisterClassW(&windowClass);
+    Expect(atom != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS,
+           "could not register background UI probe window");
+
+    BackgroundUiProbe probe{};
+    HWND window = CreateWindowExW(0, className, L"", 0, 0, 0, 0, 0, HWND_MESSAGE,
+                                  nullptr, windowClass.hInstance, &probe);
+    Expect(window != nullptr, "could not create background UI probe window");
+
+    HANDLE workerStarted = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE releaseWorker = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    Expect(workerStarted && releaseWorker, "could not create background task test events");
+
+    DWORD operationThreadId = 0;
+    PtsBackgroundOperation operation = [&](const PtsProgressCallback& progress,
+                                            std::wstring& summary,
+                                            std::wstring&) {
+        operationThreadId = GetCurrentThreadId();
+        SetEvent(workerStarted);
+        WaitForSingleObject(releaseWorker, INFINITE);
+        progress(42, L"Đang restore font trong worker...");
+        summary = L"Hoàn tất background test.";
+        return true;
+    };
+
+    HANDLE worker = nullptr;
+    std::wstring error;
+    Expect(StartPtsBackgroundTask(window, operation, worker, error),
+           "could not start Pts background task");
+    Expect(WaitForSingleObject(workerStarted, 2000) == WAIT_OBJECT_0,
+           "Pts background task did not start");
+    Expect(operationThreadId != GetCurrentThreadId(),
+           "Pts operation still ran on the UI thread");
+    Expect(WaitForSingleObject(worker, 0) == WAIT_TIMEOUT,
+           "Pts background task unexpectedly completed before release");
+
+    PostMessageW(window, kBackgroundUiHeartbeat, 0, 0);
+    Expect(PumpMessagesUntil(probe.heartbeatReceived, 1000),
+           "UI thread could not process messages while Pts task was running");
+    Expect(!probe.completionReceived,
+           "Pts task completed before the slow operation was released");
+
+    SetEvent(releaseWorker);
+    Expect(PumpMessagesUntil(probe.completionReceived, 2000),
+           "Pts background completion message was not delivered");
+    Expect(probe.progressReceived, "Pts background progress message was not delivered");
+    Expect(probe.operationSucceeded, "Pts background operation reported failure");
+    Expect(probe.workerThreadId == operationThreadId,
+           "Pts completion did not identify the worker thread");
+    Expect(WaitForSingleObject(worker, 2000) == WAIT_OBJECT_0,
+           "Pts background worker did not exit");
+
+    CloseHandle(worker);
+    CloseHandle(workerStarted);
+    CloseHandle(releaseWorker);
+    DestroyWindow(window);
 }
 
 void TestCrossVersionMappingAndCs6Aliases() {
@@ -534,6 +653,7 @@ int main() {
         TestSafeArchivePaths();
         TestCompressionRoundTrip();
         TestArchiveInspectionReportsProgress();
+        TestPtsBackgroundTaskKeepsUiThreadResponsive();
         TestCrossVersionMappingAndCs6Aliases();
         TestFontCollisionPath();
         TestSettingsBackupArchive();
