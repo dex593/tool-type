@@ -4271,7 +4271,9 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
             const std::wstring targetPath =
                 JoinPath(destinationBasePath, targetRelativePath);
             std::vector<uint8_t> bytesToWrite = raw;
-            if (options.HasTargetMapping()) {
+            if (options.HasTargetMapping() &&
+                ShouldRewritePhotoshopVersionLabel(sourceLabel,
+                                                   options.targetVersionLabel)) {
                 std::vector<uint8_t> normalized;
                 WorkspaceCompatibilityResult compatibility =
                     PreparePhotoshopWorkspaceBytesForTarget(
