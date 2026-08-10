@@ -166,6 +166,84 @@ void TestPtsDialogLoopPreservesQuitAndDestroysWindow() {
            "Pts dialog loop swallowed the outer application WM_QUIT");
 }
 
+void TestAtomicCommitPreservesDestinationAcrossReplaceFailures() {
+    namespace fs = std::filesystem;
+    fs::path root = fs::temp_directory_path() / L"tooltype-pts-atomic-commit-failures";
+    std::error_code ignored;
+    fs::remove_all(root, ignored);
+    fs::create_directories(root);
+    auto write = [](const fs::path& path, const char* value) {
+        std::ofstream output(path, std::ios::binary);
+        output << value;
+    };
+    auto read = [](const fs::path& path) {
+        std::ifstream input(path, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(input)),
+                           std::istreambuf_iterator<char>());
+    };
+
+    fs::path destination1176 = root / L"destination-1176.afang";
+    fs::path replacement1176 = root / L"replacement-1176.tmp";
+    write(destination1176, "old-1176");
+    write(replacement1176, "new-1176");
+    PtsReplaceFileCallback fail1176 =
+        [](const std::wstring&, const std::wstring&, const std::wstring& backup, DWORD) {
+            Expect(!backup.empty(), "atomic replace did not request a safety backup path");
+            SetLastError(ERROR_UNABLE_TO_MOVE_REPLACEMENT);
+            return FALSE;
+        };
+    DWORD errorCode = ERROR_SUCCESS;
+    Expect(!CommitTemporarySiblingFile(destination1176.wstring(), replacement1176.wstring(),
+                                       errorCode, fail1176),
+           "1176 partial ReplaceFile failure incorrectly committed");
+    Expect(errorCode == ERROR_UNABLE_TO_MOVE_REPLACEMENT,
+           "1176 ReplaceFile failure code was lost");
+    Expect(read(destination1176) == "old-1176",
+           "1176 ReplaceFile failure destroyed the original destination");
+    Expect(read(replacement1176) == "new-1176",
+           "1176 ReplaceFile failure destroyed the staged replacement");
+
+    fs::path destination1177 = root / L"destination-1177.afang";
+    fs::path replacement1177 = root / L"replacement-1177.tmp";
+    write(destination1177, "old-1177");
+    write(replacement1177, "new-1177");
+    PtsReplaceFileCallback fail1177 =
+        [](const std::wstring& destination, const std::wstring&,
+           const std::wstring& backup, DWORD) {
+            Expect(MoveFileExW(destination.c_str(), backup.c_str(), MOVEFILE_WRITE_THROUGH),
+                   "could not simulate the 1177 replaced-file move");
+            SetLastError(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2);
+            return FALSE;
+        };
+    errorCode = ERROR_SUCCESS;
+    Expect(!CommitTemporarySiblingFile(destination1177.wstring(), replacement1177.wstring(),
+                                       errorCode, fail1177),
+           "1177 partial ReplaceFile failure incorrectly committed");
+    Expect(errorCode == ERROR_UNABLE_TO_MOVE_REPLACEMENT_2,
+           "1177 ReplaceFile failure code was lost");
+    Expect(read(destination1177) == "old-1177",
+           "1177 ReplaceFile failure did not roll the original destination back");
+    Expect(read(replacement1177) == "new-1177",
+           "1177 ReplaceFile failure destroyed the staged replacement");
+
+    fs::path newDestination = root / L"new.afang";
+    fs::path temporary = root / L"new.tmp";
+    HANDLE temporaryFile = CreateFileW(temporary.wstring().c_str(), GENERIC_WRITE, 0, nullptr,
+                                       CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    Expect(temporaryFile != INVALID_HANDLE_VALUE, "could not create temporary attribute probe");
+    const char bytes[] = "new-archive";
+    Expect(WriteAll(temporaryFile, bytes, sizeof(bytes) - 1) && FlushFileBuffers(temporaryFile),
+           "could not write temporary attribute probe");
+    CloseHandle(temporaryFile);
+    errorCode = ERROR_SUCCESS;
+    Expect(CommitTemporarySiblingFile(newDestination.wstring(), temporary.wstring(), errorCode),
+           "new archive commit failed");
+    DWORD attrs = GetFileAttributesW(newDestination.wstring().c_str());
+    Expect(attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_TEMPORARY),
+           "committed archive retained FILE_ATTRIBUTE_TEMPORARY");
+    fs::remove_all(root, ignored);
+}
+
 void WriteTestArchive(const std::wstring& path,
                       const std::vector<TestArchiveEntry>& entries) {
     HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
@@ -1037,6 +1115,7 @@ int main() {
         TestPtsBackgroundTaskKeepsUiThreadResponsive();
         TestPtsBackgroundTaskCanBeCancelled();
         TestPtsDialogLoopPreservesQuitAndDestroysWindow();
+        TestAtomicCommitPreservesDestinationAcrossReplaceFailures();
         TestCrossVersionMappingAndCs6Aliases();
         TestFontCollisionPath();
         TestSettingsBackupArchive();
