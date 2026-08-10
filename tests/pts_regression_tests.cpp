@@ -738,6 +738,59 @@ void TestSameVersionWorkspaceRestoreKeepsDistinctVariants() {
     fs::remove_all(root, ignored);
 }
 
+void TestSameVersionCs6WorkspaceRestoreKeepsNativeBytes() {
+    namespace fs = std::filesystem;
+    fs::path root = fs::temp_directory_path() / L"tooltype-pts-same-version-native-cs6";
+    std::error_code ignored;
+    fs::remove_all(root, ignored);
+    fs::create_directories(root / L"Roaming");
+    fs::create_directories(root / L"Local");
+    ScopedEnvironmentVariable appData(L"APPDATA", (root / L"Roaming").wstring());
+    ScopedEnvironmentVariable localAppData(L"LOCALAPPDATA", (root / L"Local").wstring());
+
+    const std::string nativeCs6Workspace =
+        "\xEF\xBB\xBF<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<photoshop-workspace version=\"1.0\"><workspace version=\"1\">"
+        "<frame id=\"123\" active-palette=\"123\"/>"
+        "</workspace></photoshop-workspace>";
+    const std::wstring settingsRoot =
+        L"Adobe\\Adobe Photoshop CS6\\Adobe Photoshop CS6 Settings\\";
+    TestArchiveEntry workspace{
+        PtsEntryKind::PhotoshopSetting, L"APPDATA",
+        settingsRoot + L"WorkSpaces\\Native-CS6", L"Adobe Photoshop CS6",
+        std::vector<uint8_t>(nativeCs6Workspace.begin(), nativeCs6Workspace.end())};
+    fs::path archive = root / L"native-cs6.afang";
+    WriteTestArchive(archive.wstring(), {workspace});
+
+    PtsRestoreOptions options{};
+    options.sourceVersionLabel = L"Adobe Photoshop CS6";
+    options.targetVersionLabel = L"Adobe Photoshop CS6";
+    options.targetAppDataRelativeRoot = L"Adobe\\Adobe Photoshop CS6";
+    options.targetLocalAppDataRelativeRoot = L"Adobe\\Adobe Photoshop CS6";
+    options.archiveHasSettings = true;
+    std::wstring summary;
+    std::wstring error;
+    auto progress = [](int, const std::wstring&) {};
+    auto registryUpdater = [](const std::wstring&, const std::set<std::wstring>&) {
+        return 1u;
+    };
+    Expect(RestorePtsBackupArchive(archive.wstring(), options, progress, summary, error,
+                                   PtsCancellationCallback{}, registryUpdater),
+           "same-version native CS6 workspace restore failed");
+
+    fs::path restoredPath = root / L"Roaming" / L"Adobe" /
+                            L"Adobe Photoshop CS6" /
+                            L"Adobe Photoshop CS6 Settings" / L"WorkSpaces" /
+                            L"Native-CS6";
+    std::ifstream restored(restoredPath, std::ios::binary);
+    std::string restoredBytes((std::istreambuf_iterator<char>(restored)),
+                              std::istreambuf_iterator<char>());
+    restored.close();
+    Expect(restoredBytes == nativeCs6Workspace,
+           "same-version restore rewrote native CS6 workspace bytes");
+    fs::remove_all(root, ignored);
+}
+
 void TestCrossVersionWorkspaceAliasesDoNotOverwritePrimaryEntries() {
     namespace fs = std::filesystem;
     fs::path root = fs::temp_directory_path() / L"tooltype-pts-cross-version-workspaces";
@@ -1318,6 +1371,7 @@ int main() {
         TestCancelledRestoreStopsBeforeNextFile();
         TestCrossVersionArchiveRestore();
         TestSameVersionWorkspaceRestoreKeepsDistinctVariants();
+        TestSameVersionCs6WorkspaceRestoreKeepsNativeBytes();
         TestCrossVersionWorkspaceAliasesDoNotOverwritePrimaryEntries();
         TestCancelledCrossVersionRestoreDoesNotAliasOverFuturePrimary();
         TestIdenticalFontRestoreIsSkipped();
