@@ -172,6 +172,44 @@ void WriteTestArchive(const std::wstring& path,
     Expect(ok, "could not write test archive");
 }
 
+bool ArchiveContainsRelativePath(const std::wstring& path,
+                                 const std::wstring& expectedRelativePath) {
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    uint32_t count = 0;
+    std::wstring error;
+    if (!ReadPtsArchiveHeader(file, count, error)) {
+        CloseHandle(file);
+        return false;
+    }
+    const std::wstring expected = LowerWide(NormalizeRelativePathSlashes(expectedRelativePath));
+    for (uint32_t i = 0; i < count; ++i) {
+        uint8_t kind = 0;
+        std::wstring rootToken;
+        std::wstring relativePath;
+        std::wstring displayName;
+        uint64_t originalSize = 0;
+        uint64_t storedSize = 0;
+        uint8_t method = 0;
+        if (!ReadPtsArchiveEntryMetadata(file, kind, rootToken, relativePath, displayName,
+                                         originalSize, storedSize, method, error)) {
+            CloseHandle(file);
+            return false;
+        }
+        if (LowerWide(NormalizeRelativePathSlashes(relativePath)) == expected) {
+            CloseHandle(file);
+            return true;
+        }
+        if (!SkipFileBytes(file, storedSize)) {
+            CloseHandle(file);
+            return false;
+        }
+    }
+    CloseHandle(file);
+    return false;
+}
+
 void TestSafeArchivePaths() {
     Expect(IsSafeRelativePath(L"Adobe\\Adobe Photoshop 2025\\Presets\\Actions.atn"),
            "valid Photoshop path rejected");
@@ -507,12 +545,16 @@ void TestSettingsBackupArchive() {
     fs::create_directories(install2024);
     fs::create_directories(settings);
     fs::create_directories(settings2024);
+    fs::create_directories(settings / L"WorkSpaces (Modified)");
     {
         std::ofstream photoshop(install / L"Photoshop.exe", std::ios::binary);
         photoshop << "test";
         std::ofstream preference(settings / L"Adobe Photoshop 2025 Prefs.psp",
                                  std::ios::binary);
         preference << "preference-data";
+        std::ofstream workspace(settings / L"WorkSpaces (Modified)" / L"Editing.psw",
+                                std::ios::binary);
+        workspace << "workspace-layout-data";
         std::ofstream photoshop2024(install2024 / L"Photoshop.exe", std::ios::binary);
         photoshop2024 << "test";
         std::ofstream preference2024(settings2024 / L"Adobe Photoshop 2024 Prefs.psp",
@@ -555,6 +597,64 @@ void TestSettingsBackupArchive() {
     Expect(scan.versions.size() == 1 &&
                LowerWide(scan.versions.front().label) == L"adobe photoshop 2025",
            "backup selection leaked settings from another installed version");
+    Expect(ArchiveContainsRelativePath(
+               archive.wstring(),
+               L"Adobe\\Adobe Photoshop 2025\\Adobe Photoshop 2025 Settings\\"
+               L"WorkSpaces (Modified)\\Editing.psw"),
+           "settings backup omitted the saved Photoshop workspace");
+    fs::remove_all(root, ignored);
+}
+
+void TestSettingsBackupRequiresPhotoshopToBeClosed() {
+    namespace fs = std::filesystem;
+    fs::path root = fs::temp_directory_path() / L"tooltype-pts-running-backup";
+    std::error_code ignored;
+    fs::remove_all(root, ignored);
+    fs::path appDataRoot = root / L"Roaming";
+    fs::path localRoot = root / L"Local";
+    fs::path programFiles = root / L"ProgramFiles";
+    fs::path install = programFiles / L"Adobe" / L"Adobe Photoshop 2025";
+    fs::path settings = appDataRoot / L"Adobe" / L"Adobe Photoshop 2025" /
+                        L"Adobe Photoshop 2025 Settings";
+    fs::create_directories(install);
+    fs::create_directories(settings / L"WorkSpaces (Modified)");
+    {
+        std::ofstream photoshop(install / L"Photoshop.exe", std::ios::binary);
+        photoshop << "test";
+        std::ofstream workspace(settings / L"WorkSpaces (Modified)" / L"Editing.psw",
+                                std::ios::binary);
+        workspace << "workspace-not-flushed-until-photoshop-closes";
+    }
+
+    ScopedEnvironmentVariable appData(L"APPDATA", appDataRoot.wstring());
+    ScopedEnvironmentVariable localAppData(L"LOCALAPPDATA", localRoot.wstring());
+    ScopedEnvironmentVariable pf(L"ProgramFiles", programFiles.wstring());
+    ScopedEnvironmentVariable pf32(L"ProgramFiles(x86)", programFiles.wstring());
+    ScopedEnvironmentVariable pf64(L"ProgramW6432", programFiles.wstring());
+
+    auto versions = DiscoverPhotoshopVersions();
+    auto version = std::find_if(versions.begin(), versions.end(), [](const auto& candidate) {
+        return LowerWide(candidate.label) == L"adobe photoshop 2025";
+    });
+    Expect(version != versions.end(), "running-backup Photoshop version was not discovered");
+    PtsBackupOptions options{};
+    options.selectedPhotoshopVersionLabel = version->label;
+    options.selectedPhotoshopVersionLabels.insert(LowerWide(version->label));
+    for (const auto& candidateRoot : version->roots) {
+        options.selectedPhotoshopVersionKeys.insert(candidateRoot.versionKey);
+    }
+
+    fs::path archive = root / L"settings.afang";
+    std::wstring summary;
+    std::wstring error;
+    auto progress = [](int, const std::wstring&) {};
+    Expect(!CreatePtsBackupArchive(archive.wstring(), true, false, options, progress,
+                                   summary, error, PtsCancellationCallback{},
+                                   [] { return true; }),
+           "settings backup ran while Photoshop was still running");
+    Expect(!fs::exists(archive), "running Photoshop left a stale settings archive");
+    Expect(LowerWide(error).find(L"đóng photoshop") != std::wstring::npos,
+           "running Photoshop backup did not explain how to save the current workspace");
     fs::remove_all(root, ignored);
 }
 
@@ -848,6 +948,7 @@ int main() {
         TestCrossVersionMappingAndCs6Aliases();
         TestFontCollisionPath();
         TestSettingsBackupArchive();
+        TestSettingsBackupRequiresPhotoshopToBeClosed();
         TestCancelledBackupDeletesIncompleteArchive();
         TestCancelledRestoreStopsBeforeNextFile();
         TestCrossVersionArchiveRestore();
