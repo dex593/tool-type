@@ -1856,6 +1856,48 @@ bool ReadUtf8String(HANDLE file, std::wstring& value) {
     return true;
 }
 
+HANDLE CreateTemporarySiblingFile(const std::wstring& path, DWORD desiredAccess,
+                                  DWORD attributes, std::wstring& tempPath) {
+    static volatile LONG tempSequence = 0;
+    DWORD lastError = ERROR_FILE_EXISTS;
+    for (int attempt = 0; attempt < 32; ++attempt) {
+        LONG sequence = InterlockedIncrement(&tempSequence);
+        tempPath = path + L".tooltype-tmp-" + std::to_wstring(GetCurrentProcessId()) +
+                   L"-" + std::to_wstring(sequence);
+        HANDLE file = CreateFileW(tempPath.c_str(), desiredAccess, 0, nullptr, CREATE_NEW,
+                                  attributes, nullptr);
+        if (file != INVALID_HANDLE_VALUE) return file;
+        lastError = GetLastError();
+        if (lastError != ERROR_FILE_EXISTS && lastError != ERROR_ALREADY_EXISTS) break;
+    }
+    SetLastError(lastError);
+    return INVALID_HANDLE_VALUE;
+}
+
+bool CommitTemporarySiblingFile(const std::wstring& path, const std::wstring& tempPath,
+                                DWORD& errorCode) {
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    bool destinationExists = attrs != INVALID_FILE_ATTRIBUTES;
+    bool clearedReadOnly = destinationExists && !(attrs & FILE_ATTRIBUTE_DIRECTORY) &&
+                           (attrs & FILE_ATTRIBUTE_READONLY);
+    if (clearedReadOnly) SetFileAttributesW(path.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
+
+    bool replaced = false;
+    if (destinationExists && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        replaced = ReplaceFileW(path.c_str(), tempPath.c_str(), nullptr,
+                                REPLACEFILE_IGNORE_MERGE_ERRORS, nullptr, nullptr) != FALSE;
+    }
+    if (!replaced) {
+        replaced = MoveFileExW(tempPath.c_str(), path.c_str(),
+                               MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+    }
+    if (replaced) return true;
+
+    errorCode = GetLastError();
+    if (clearedReadOnly) SetFileAttributesW(path.c_str(), attrs);
+    return false;
+}
+
 bool WriteBytesToFile(const std::wstring& path, const std::vector<uint8_t>& bytes,
                       std::wstring& error) {
     if (!EnsureParentDirectory(path)) {
@@ -1863,20 +1905,9 @@ bool WriteBytesToFile(const std::wstring& path, const std::vector<uint8_t>& byte
         return false;
     }
 
-    static volatile LONG tempSequence = 0;
     std::wstring tempPath;
-    HANDLE file = INVALID_HANDLE_VALUE;
-    for (int attempt = 0; attempt < 32; ++attempt) {
-        LONG sequence = InterlockedIncrement(&tempSequence);
-        tempPath = path + L".tooltype-tmp-" + std::to_wstring(GetCurrentProcessId()) +
-                   L"-" + std::to_wstring(sequence);
-        file = CreateFileW(tempPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
-                           FILE_ATTRIBUTE_TEMPORARY, nullptr);
-        if (file != INVALID_HANDLE_VALUE) break;
-        if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) {
-            break;
-        }
-    }
+    HANDLE file = CreateTemporarySiblingFile(path, GENERIC_WRITE, FILE_ATTRIBUTE_TEMPORARY,
+                                             tempPath);
     if (file == INVALID_HANDLE_VALUE) {
         DWORD rc = GetLastError();
         error = L"Không tạo được file tạm để restore.\nMã lỗi: " +
@@ -1896,25 +1927,9 @@ bool WriteBytesToFile(const std::wstring& path, const std::vector<uint8_t>& byte
         return false;
     }
 
-    DWORD attrs = GetFileAttributesW(path.c_str());
-    bool destinationExists = attrs != INVALID_FILE_ATTRIBUTES;
-    bool clearedReadOnly = destinationExists && !(attrs & FILE_ATTRIBUTE_DIRECTORY) &&
-                           (attrs & FILE_ATTRIBUTE_READONLY);
-    if (clearedReadOnly) SetFileAttributesW(path.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
-
-    bool replaced = false;
-    if (destinationExists && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-        replaced = ReplaceFileW(path.c_str(), tempPath.c_str(), nullptr,
-                                REPLACEFILE_IGNORE_MERGE_ERRORS, nullptr, nullptr) != FALSE;
-    }
-    if (!replaced) {
-        replaced = MoveFileExW(tempPath.c_str(), path.c_str(),
-                               MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
-    }
-    if (!replaced) {
-        DWORD rc = GetLastError();
+    DWORD rc = ERROR_SUCCESS;
+    if (!CommitTemporarySiblingFile(path, tempPath, rc)) {
         DeleteFileW(tempPath.c_str());
-        if (clearedReadOnly) SetFileAttributesW(path.c_str(), attrs);
         error = L"Không thay được file đích khi restore.\nMã lỗi: " +
                 std::to_wstring(rc) + L".";
         return false;
@@ -2056,8 +2071,9 @@ bool CreatePtsBackupArchive(const std::wstring& path, bool includeSettings, bool
         error = L"Đã hủy backup Pts.";
         return false;
     }
-    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE | GENERIC_READ, 0, nullptr,
-                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    std::wstring tempPath;
+    HANDLE file = CreateTemporarySiblingFile(path, GENERIC_WRITE | GENERIC_READ,
+                                             FILE_ATTRIBUTE_TEMPORARY, tempPath);
     if (file == INVALID_HANDLE_VALUE) {
         error = L"Không tạo được file backup .afang.";
         return false;
@@ -2117,20 +2133,29 @@ bool CreatePtsBackupArchive(const std::wstring& path, bool includeSettings, bool
         LARGE_INTEGER pos{};
         pos.QuadPart = sizeof(kAfangMagic) + sizeof(uint32_t);
         ok = SetFilePointerEx(file, pos, nullptr, FILE_BEGIN) &&
-             WriteU32File(file, writtenEntries);
+             WriteU32File(file, writtenEntries) &&
+             FlushFileBuffers(file);
     }
     CloseHandle(file);
 
     if (cancellationRequested()) cancellationObserved = true;
     if (cancellationObserved) {
-        DeleteFileW(path.c_str());
-        error = L"Đã hủy backup Pts. File backup chưa hoàn tất đã được xóa.";
+        DeleteFileW(tempPath.c_str());
+        error = L"Đã hủy backup Pts. File backup chưa hoàn tất đã được xóa; backup cũ (nếu có) vẫn được giữ nguyên.";
         return false;
     }
 
     if (!ok || writtenEntries == 0) {
-        DeleteFileW(path.c_str());
+        DeleteFileW(tempPath.c_str());
         error = L"Lỗi khi ghi file backup .afang.";
+        return false;
+    }
+
+    DWORD commitError = ERROR_SUCCESS;
+    if (!CommitTemporarySiblingFile(path, tempPath, commitError)) {
+        DeleteFileW(tempPath.c_str());
+        error = L"Không thay được file backup .afang đích.\nMã lỗi: " +
+                std::to_wstring(commitError) + L".";
         return false;
     }
 
