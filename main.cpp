@@ -1962,7 +1962,9 @@ bool RestoreReplacementBackup(const std::wstring& path, const std::wstring& back
 
 bool CommitTemporarySiblingFile(const std::wstring& path, const std::wstring& tempPath,
                                 DWORD& errorCode,
-                                const PtsReplaceFileCallback& replaceFile = {}) {
+                                const PtsReplaceFileCallback& replaceFile = {},
+                                std::wstring* recoveryBackupPath = nullptr) {
+    if (recoveryBackupPath) recoveryBackupPath->clear();
     DWORD attrs = GetFileAttributesW(path.c_str());
     bool destinationExists = attrs != INVALID_FILE_ATTRIBUTES;
     bool clearedReadOnly = destinationExists && !(attrs & FILE_ATTRIBUTE_DIRECTORY) &&
@@ -1983,6 +1985,11 @@ bool CommitTemporarySiblingFile(const std::wstring& path, const std::wstring& te
     }
 
     const std::wstring backupPath = tempPath + L".previous";
+    if (GetFileAttributesW(backupPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        errorCode = ERROR_FILE_EXISTS;
+        if (clearedReadOnly) SetFileAttributesW(path.c_str(), attrs);
+        return false;
+    }
     BOOL replaced = replaceFile
                         ? replaceFile(path, tempPath, backupPath,
                                       REPLACEFILE_IGNORE_MERGE_ERRORS)
@@ -1996,7 +2003,9 @@ bool CommitTemporarySiblingFile(const std::wstring& path, const std::wstring& te
 
     errorCode = GetLastError();
     if (FileExists(backupPath)) {
-        RestoreReplacementBackup(path, backupPath);
+        if (!RestoreReplacementBackup(path, backupPath) && recoveryBackupPath) {
+            *recoveryBackupPath = backupPath;
+        }
     }
     if (clearedReadOnly) SetFileAttributesW(path.c_str(), attrs);
     return false;
@@ -2032,10 +2041,14 @@ bool WriteBytesToFile(const std::wstring& path, const std::vector<uint8_t>& byte
     }
 
     DWORD rc = ERROR_SUCCESS;
-    if (!CommitTemporarySiblingFile(path, tempPath, rc)) {
+    std::wstring recoveryBackupPath;
+    if (!CommitTemporarySiblingFile(path, tempPath, rc, {}, &recoveryBackupPath)) {
         DeleteFileW(tempPath.c_str());
         error = L"Không thay được file đích khi restore.\nMã lỗi: " +
                 std::to_wstring(rc) + L".";
+        if (!recoveryBackupPath.empty()) {
+            error += L"\nBản gốc an toàn còn tại: " + recoveryBackupPath;
+        }
         return false;
     }
     return true;
@@ -2271,10 +2284,15 @@ bool CreatePtsBackupArchive(const std::wstring& path, bool includeSettings, bool
     }
 
     DWORD commitError = ERROR_SUCCESS;
-    if (!CommitTemporarySiblingFile(path, tempPath, commitError)) {
+    std::wstring recoveryBackupPath;
+    if (!CommitTemporarySiblingFile(path, tempPath, commitError, {},
+                                    &recoveryBackupPath)) {
         DeleteFileW(tempPath.c_str());
         error = L"Không thay được file backup .afang đích.\nMã lỗi: " +
                 std::to_wstring(commitError) + L".";
+        if (!recoveryBackupPath.empty()) {
+            error += L"\nBackup cũ an toàn còn tại: " + recoveryBackupPath;
+        }
         return false;
     }
 
