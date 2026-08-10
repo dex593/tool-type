@@ -1,4 +1,4 @@
-#include "../main.cpp"
+#include "../text_normalization.h"
 
 #include <iostream>
 
@@ -38,6 +38,26 @@ int main() {
     ExpectEqual(L"paste pipeline preserves an attached ellipsis after stripping a marker",
                 PasteTextForLine(L"* ...hôm"),
                 L"...hôm");
+    ExpectEqual(L"paste pipeline strips dash markers",
+                PasteTextForLine(L"  -   nội dung"),
+                L"nội dung");
+    ExpectEqual(L"paste pipeline strips quote markers",
+                PasteTextForLine(L"> trích dẫn"),
+                L"trích dẫn");
+    ExpectEqual(L"blank lines are not pasteable",
+                PasteTextForLine(L"   "),
+                L"");
+    ExpectEqual(L"comment lines are not pasteable",
+                PasteTextForLine(L"  // ghi chú"),
+                L"");
+    ExpectEqual(L"spaces before punctuation and closers are removed",
+                NormalizePasteText(L"Xin chào , bạn ! )  "),
+                L"Xin chào, bạn!)");
+
+    if (!IsPasteableTextLine(L"Nội dung") || IsPasteableTextLine(L"// ghi chú")) {
+        std::cerr << "FAIL: pasteability classification\n";
+        ++failures;
+    }
 
     if (failures != 0) {
         std::cerr << failures << " normalization test(s) failed.\n";

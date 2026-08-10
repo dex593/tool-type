@@ -8,4 +8,5 @@ tests/*.exe
 tests/*.gcda
 tests/*.gcno
 tests/*.gcov
+tests/coverage/
 .omx/

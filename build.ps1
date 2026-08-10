@@ -71,6 +71,7 @@ Write-Host "Runtime link flags: $($runtimeLinkFlags -join ' ')"
     -municode `
     -mwindows `
     main.cpp `
+    text_normalization.cpp `
     $resourceObj `
     -o ToolType.exe `
     "-Wl,--dynamicbase" `
