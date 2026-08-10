@@ -24,6 +24,7 @@
 - Commit `abe4116` added an injected Registry updater so native tests cannot redirect the real `SettingsFilePath` to a deleted temp fixture.
 - Commit `1a2fa98` reproduced same-version CS6 workspace corruption: aliases made `WorkSpaces\Untitled-1` and `WorkSpaces (Modified)\Untitled-1` overwrite each other.
 - Commits `4d8bf6e`, `3e1665e`, and `f67029e` covered `WM_QUIT` preservation, documented `ReplaceFileW` partial-failure states 1176/1177, and the late cancellation/commit race.
+- Commit `762f732` reproduced the equivalent cross-version corruption when two distinct source workspace variants generated aliases for each other's primary target.
 
 ## GREEN implementation
 
@@ -40,6 +41,7 @@
 - Commit `9cc37f6` routes Registry updates through an injectable seam in tests; production still updates the selected installed Photoshop version.
 - Commit `fd2582a` limits workspace compatibility aliases to real cross-version restores, so same-version `WorkSpaces` and `WorkSpaces (Modified)` files retain their distinct bytes.
 - Commits `4077dea`, `ba43695`, and `a1e735b` preserve outer `WM_QUIT`, use a safety backup/rollback for `ReplaceFileW` 1176/1177, clear the temporary file attribute, and arbitrate `Hủy` versus the atomic commit point with a single-winner gate.
+- Commit `b2248d0` tracks primary workspace destinations during cross-version restore; a compatibility alias can no longer overwrite a primary entry already restored from the archive.
 - Windows path validation rejects traversal, empty/dot segments, control characters, trailing dot/space, and reserved device prefixes before the first period.
 
 ## Regression specification
@@ -57,6 +59,7 @@
 | Cancelled restore stops before the next file and preserves a completed prior file | `TestCancelledRestoreStopsBeforeNextFile` | PASS |
 | Modern settings map to CS6 aliases/workspace layout | `TestCrossVersionMappingAndCs6Aliases`, `TestCrossVersionArchiveRestore` | PASS |
 | Same-version workspace variants keep their own bytes instead of overwriting through aliases | `TestSameVersionWorkspaceRestoreKeepsDistinctVariants` | PASS |
+| Cross-version workspace aliases cannot overwrite distinct primary workspace variants | `TestCrossVersionWorkspaceAliasesDoNotOverwritePrimaryEntries` | PASS |
 | Native restore tests request but do not write the real Photoshop Registry path | injected updater in `TestCrossVersionArchiveRestore` | PASS |
 | `WM_QUIT` destroys the Pts dialog and is reposted to the outer app loop | `TestPtsDialogLoopPreservesQuitAndDestroysWindow` | PASS |
 | Replace failures 1176/1177 restore the old destination; committed files lose the temporary attribute | `TestAtomicCommitPreservesDestinationAcrossReplaceFailures` | PASS |
