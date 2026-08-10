@@ -780,6 +780,69 @@ void TestCrossVersionWorkspaceAliasesDoNotOverwritePrimaryEntries() {
     fs::remove_all(root, ignored);
 }
 
+void TestCancelledCrossVersionRestoreDoesNotAliasOverFuturePrimary() {
+    namespace fs = std::filesystem;
+    fs::path root = fs::temp_directory_path() / L"tooltype-pts-cancelled-workspace-alias";
+    std::error_code ignored;
+    fs::remove_all(root, ignored);
+    fs::create_directories(root / L"Roaming");
+    fs::create_directories(root / L"Local");
+    ScopedEnvironmentVariable appData(L"APPDATA", (root / L"Roaming").wstring());
+    ScopedEnvironmentVariable localAppData(L"LOCALAPPDATA", (root / L"Local").wstring());
+
+    const std::string primaryXml =
+        "<photoshop-workspace version=\"2.0\"><frame name=\"first-primary\"/>"
+        "</photoshop-workspace>";
+    const std::string futurePrimaryXml =
+        "<photoshop-workspace version=\"2.0\"><frame name=\"future-primary\"/>"
+        "</photoshop-workspace>";
+    const std::wstring sourceSettings =
+        L"Adobe\\Adobe Photoshop 2025\\Adobe Photoshop 2025 Settings\\";
+    TestArchiveEntry primary{
+        PtsEntryKind::PhotoshopSetting, L"APPDATA",
+        sourceSettings + L"WorkSpaces\\Editing.psw", L"Adobe Photoshop 2025",
+        std::vector<uint8_t>(primaryXml.begin(), primaryXml.end())};
+    TestArchiveEntry futurePrimary{
+        PtsEntryKind::PhotoshopSetting, L"APPDATA",
+        sourceSettings + L"WorkSpaces (Modified)\\Editing.psw",
+        L"Adobe Photoshop 2025",
+        std::vector<uint8_t>(futurePrimaryXml.begin(), futurePrimaryXml.end())};
+    fs::path archive = root / L"cancelled-cross-version.afang";
+    WriteTestArchive(archive.wstring(), {primary, futurePrimary});
+
+    PtsRestoreOptions options{};
+    options.sourceVersionLabel = L"Adobe Photoshop 2025";
+    options.targetVersionLabel = L"Adobe Photoshop CS6";
+    options.targetAppDataRelativeRoot = L"Adobe\\Adobe Photoshop CS6";
+    options.targetLocalAppDataRelativeRoot = L"Adobe\\Adobe Photoshop CS6";
+    options.archiveHasSettings = true;
+    bool cancelNow = false;
+    auto progress = [&](int, const std::wstring& message) {
+        if (message.find(L"Đang restore file 2/2") != std::wstring::npos) cancelNow = true;
+    };
+    PtsCancellationCallback cancelled = [&] { return cancelNow; };
+    std::wstring summary;
+    std::wstring error;
+    Expect(!RestorePtsBackupArchive(archive.wstring(), options, progress, summary, error,
+                                    cancelled),
+           "cancelled cross-version workspace restore incorrectly succeeded");
+
+    fs::path restoredSettings = root / L"Roaming" / L"Adobe" /
+                                L"Adobe Photoshop CS6" /
+                                L"Adobe Photoshop CS6 Settings";
+    fs::path firstPath = restoredSettings / L"WorkSpaces" / L"Editing.psw";
+    fs::path futurePath = restoredSettings / L"WorkSpaces (Modified)" / L"Editing.psw";
+    std::ifstream firstFile(firstPath, std::ios::binary);
+    std::string firstBytes((std::istreambuf_iterator<char>(firstFile)),
+                           std::istreambuf_iterator<char>());
+    firstFile.close();
+    Expect(firstBytes.find("first-primary") != std::string::npos,
+           "cancelled restore did not retain the completed primary workspace");
+    Expect(!fs::exists(futurePath),
+           "cancelled restore left an alias in a future primary workspace path");
+    fs::remove_all(root, ignored);
+}
+
 void TestSettingsBackupArchive() {
     namespace fs = std::filesystem;
     fs::path root = fs::temp_directory_path() / L"tooltype-pts-settings-backup";
@@ -1232,6 +1295,7 @@ int main() {
         TestCrossVersionArchiveRestore();
         TestSameVersionWorkspaceRestoreKeepsDistinctVariants();
         TestCrossVersionWorkspaceAliasesDoNotOverwritePrimaryEntries();
+        TestCancelledCrossVersionRestoreDoesNotAliasOverFuturePrimary();
         TestIdenticalFontRestoreIsSkipped();
         TestMalformedArchiveDoesNotWriteAnything();
         TestAtomicRestoreWritePreservesLockedDestination();
