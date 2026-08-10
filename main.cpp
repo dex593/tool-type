@@ -808,7 +808,10 @@ DWORD WINAPI PtsBackgroundTaskThreadProc(void* parameter) {
     std::unique_ptr<PtsBackgroundTaskContext> context(
         static_cast<PtsBackgroundTaskContext*>(parameter));
     auto* result = new (std::nothrow) PtsBackgroundResult{};
-    if (!result) return 1;
+    if (!result) {
+        PostMessageW(context->notifyWindow, WM_APP_PTS_OPERATION_DONE, 1, 0);
+        return 1;
+    }
     result->workerThreadId = GetCurrentThreadId();
 
     const HWND notifyWindow = context->notifyWindow;
@@ -859,8 +862,12 @@ bool StartPtsBackgroundTask(HWND notifyWindow, const PtsBackgroundOperation& ope
         return false;
     }
 
-    auto* context = new (std::nothrow) PtsBackgroundTaskContext{
-        notifyWindow, operation, cancellation};
+    PtsBackgroundTaskContext* context = nullptr;
+    try {
+        context = new PtsBackgroundTaskContext{notifyWindow, operation, cancellation};
+    } catch (...) {
+        context = nullptr;
+    }
     if (!context) {
         error = L"Không đủ bộ nhớ để bắt đầu thao tác Pts.";
         return false;
@@ -2114,6 +2121,7 @@ bool CreatePtsBackupArchive(const std::wstring& path, bool includeSettings, bool
     }
     CloseHandle(file);
 
+    if (cancellationRequested()) cancellationObserved = true;
     if (cancellationObserved) {
         DeleteFileW(path.c_str());
         error = L"Đã hủy backup Pts. File backup chưa hoàn tất đã được xóa.";
@@ -3786,6 +3794,10 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
         if (!InspectPtsArchiveVersions(path, preflight, error, progress, cancelled)) return false;
         archiveHasSettings = preflight.hasSettings;
     }
+    if (archiveHasSettings && IsPhotoshopRunning()) {
+        error = L"Photoshop đang chạy. Hãy đóng Photoshop trước khi restore settings.";
+        return false;
+    }
 
     HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
@@ -3815,11 +3827,12 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
     uint32_t workspaceCompatibilityConversions = 0;
     uint32_t registrySettingsPathUpdates = 0;
     uint64_t restoredBytes = 0;
+    bool wroteAnyDestination = false;
     std::set<std::wstring> restoredSettingsRoots;
     std::set<std::wstring> targetSettingsFoldersForRegistry;
     std::vector<RestoredUserFont> fontsToRegister;
     auto cancellationError = [&] {
-        return restored > 0
+        return restored > 0 || wroteAnyDestination
                    ? L"Đã hủy restore Pts. Các file đã restore trước đó được giữ lại."
                    : L"Đã hủy restore Pts.";
     };
@@ -3935,6 +3948,7 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
                     error = L"Không ghi được font " + FileNameOnly(destination) + L".\n" + error;
                     return false;
                 }
+                wroteAnyDestination = true;
                 ++fontFilesWritten;
                 restoredBytes += raw.size();
             }
@@ -4023,6 +4037,7 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
                 CloseHandle(file);
                 return false;
             }
+            wroteAnyDestination = true;
 
             if (options.HasTargetMapping() && rootToken == L"APPDATA") {
                 std::wstring settingsFolderRelativePath;
@@ -4074,6 +4089,10 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
         DWORD_PTR unused = 0;
         SendMessageTimeoutW(HWND_BROADCAST, WM_FONTCHANGE, 0, 0,
                             SMTO_ABORTIFHUNG, 1000, &unused);
+        if (cancellationRequested()) {
+            error = cancellationError();
+            return false;
+        }
     }
 
     if (options.HasTargetMapping() && settingsRestored > 0 &&
@@ -4085,6 +4104,11 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
         progress(97, L"Đang cập nhật SettingsFilePath...");
         registrySettingsPathUpdates = UpdatePhotoshopSettingsFilePathRegistry(
             options.targetVersionLabel, targetSettingsFoldersForRegistry);
+    }
+
+    if (cancellationRequested()) {
+        error = cancellationError();
+        return false;
     }
 
     progress(100, L"Hoàn tất restore .afang.");
@@ -4607,8 +4631,14 @@ private:
             }
             case WM_APP_PTS_OPERATION_DONE: {
                 auto* result = reinterpret_cast<PtsBackgroundResult*>(lp);
-                if (state && state->app && result) {
-                    state->app->HandlePtsBackgroundCompletion(state, *result);
+                if (state && state->app) {
+                    if (result) {
+                        state->app->HandlePtsBackgroundCompletion(state, *result);
+                    } else {
+                        PtsBackgroundResult fallback{};
+                        fallback.error = L"Không đủ bộ nhớ để nhận kết quả thao tác Pts.";
+                        state->app->HandlePtsBackgroundCompletion(state, fallback);
+                    }
                 }
                 delete result;
                 return 0;
@@ -6284,8 +6314,10 @@ private:
     }
 
     void PumpPtsDialogMessages(HWND dialog) {
+        MSG quit{};
+        if (PeekMessageW(&quit, nullptr, WM_QUIT, WM_QUIT, PM_NOREMOVE)) return;
         MSG msg{};
-        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        while (PeekMessageW(&msg, dialog, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) {
                 PostQuitMessage(static_cast<int>(msg.wParam));
                 break;
@@ -6546,11 +6578,16 @@ private:
         SetFocus(state.list);
 
         MSG msg{};
-        while (IsWindow(dialog) && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        BOOL getMessageResult = TRUE;
+        while (IsWindow(dialog) &&
+               (getMessageResult = GetMessageW(&msg, nullptr, 0, 0)) > 0) {
             if (!IsDialogMessageW(dialog, &msg)) {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
+        }
+        if (getMessageResult == 0) {
+            PostQuitMessage(static_cast<int>(msg.wParam));
         }
 
         EnableWindow(parent, TRUE);
@@ -6688,7 +6725,13 @@ private:
             return;
         }
 
-        std::shared_ptr<void> backupOptions = std::make_shared<PtsBackupOptions>(options);
+        std::shared_ptr<void> backupOptions;
+        try {
+            backupOptions = std::make_shared<PtsBackupOptions>(options);
+        } catch (...) {
+            UpdatePtsProgress(state, 0, L"Không đủ bộ nhớ để bắt đầu backup.");
+            return;
+        }
         PtsBackgroundOperation operation =
             [path, includeSettings, includeFonts, backupOptions](
                 const PtsProgressCallback& progress,
@@ -6771,7 +6814,13 @@ private:
         }
 
         SetPtsDialogBusy(state, false);
-        std::shared_ptr<void> restoreOptions = std::make_shared<PtsRestoreOptions>(options);
+        std::shared_ptr<void> restoreOptions;
+        try {
+            restoreOptions = std::make_shared<PtsRestoreOptions>(options);
+        } catch (...) {
+            UpdatePtsProgress(state, 0, L"Không đủ bộ nhớ để bắt đầu restore.");
+            return;
+        }
         PtsBackgroundOperation operation =
             [path, restoreOptions](const PtsProgressCallback& workerProgress,
                             const PtsCancellationCallback& workerCancelled,

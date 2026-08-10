@@ -5,6 +5,7 @@
 - Restore the `Pts` popup for Photoshop settings and font backup/restore using `.afang` archives.
 - When several Photoshop versions are installed, backup must let the user choose exactly one source version; restore must let the user choose both the archived source version and the installed destination version.
 - Font restore must avoid redundant file writes and repeated `-restored-N` copies, register fonts for the current user, and keep the popup responsive during large scans/registration batches.
+- Backup/restore core work must run outside the UI thread, and the user must be able to cancel an active operation without terminating a thread unsafely.
 - Restore must reject malformed or unsafe paths, preserve an existing destination if a write fails, and never claim CS6 workspace success when conversion is incompatible.
 
 ## RED checkpoints
@@ -16,6 +17,8 @@
 - An incompatible CS6 workspace archive exposed a false-success/raw-write fallback.
 - The final responsiveness regression added a 160-entry archive inspection callback requirement. Before the callback API existed, `run-pts-tests.ps1` failed to compile with “too many arguments to function `InspectPtsArchiveVersions`”.
 - Additional filename tests rejected `CON.backup.ttf` and control characters; both represent Windows path rules not covered by the initial validator.
+- Commit `e99dca4` added a deterministic worker barrier: while the worker is deliberately blocked, the UI must process a heartbeat before completion. It failed to compile because no background-task transport existed.
+- Commit `09bb7b6` added the cancellation-token/result contract. Commit `33d1732` extended RED coverage to incomplete-backup cleanup and restore stopping before the next file.
 
 ## GREEN implementation
 
@@ -24,7 +27,9 @@
 - Added cross-version path aliases and explicit CS6 workspace outcomes: not needed, already compatible, converted, or incompatible.
 - Restored fonts into `%LOCALAPPDATA%\Microsoft\Windows\Fonts`, reusing identical destination/collision files, batching HKCU Registry updates, and broadcasting `WM_FONTCHANGE` once.
 - Writes to existing Photoshop settings are staged in the same directory, flushed, and atomically replaced so a failed write does not truncate the original.
-- Progress callbacks now pulse during settings/font discovery, `.afang` inspection, extraction, and font registration. The popup throttles paints/message pumping to approximately 75 ms while disabling its actions during work.
+- Commit `2938a5c` moved archive creation/restoration, compression, file I/O, font registration, Registry work, and the font-change broadcast to a joinable worker. Progress/completion is marshalled back with `WM_APP` messages; controls and message boxes remain UI-thread-only.
+- Progress posts are throttled to approximately 75 ms. The popup remains responsive without re-entering the operation call stack, disables conflicting actions, and changes `Đóng` to `Hủy` while work is active.
+- Cancellation is cooperative: backup checks during discovery and between compression/write stages and deletes an incomplete `.afang`; restore checks before additional metadata, writes, aliases, registration and completion. Already completed restore writes are retained and reported rather than rolled back or falsely reported as success.
 - Windows path validation rejects traversal, empty/dot segments, control characters, trailing dot/space, and reserved device prefixes before the first period.
 
 ## Regression specification
@@ -34,7 +39,11 @@
 | Safe archive paths and Windows device names | `TestSafeArchivePaths` | PASS |
 | `.afang` compression/decompression round trip | `TestCompressionRoundTrip` | PASS |
 | Large metadata inspection reports periodic progress | `TestArchiveInspectionReportsProgress` | PASS |
+| A blocked Pts worker does not block UI heartbeat/progress/completion dispatch | `TestPtsBackgroundTaskKeepsUiThreadResponsive` | PASS |
+| A cancellation request reaches the worker and completion reports cancelled, not success | `TestPtsBackgroundTaskCanBeCancelled` | PASS |
 | Multiple installed Photoshop versions are discovered and one selected version is archived | `TestSettingsBackupArchive` | PASS |
+| Cancelled backup leaves no incomplete `.afang` | `TestCancelledBackupDeletesIncompleteArchive` | PASS |
+| Cancelled restore stops before the next file and preserves a completed prior file | `TestCancelledRestoreStopsBeforeNextFile` | PASS |
 | Modern settings map to CS6 aliases/workspace layout | `TestCrossVersionMappingAndCs6Aliases`, `TestCrossVersionArchiveRestore` | PASS |
 | A second identical font restore reuses `-restored-1` and preserves unrelated Registry mappings | `TestIdenticalFontRestoreIsSkipped` | PASS |
 | Malformed archives perform no writes | `TestMalformedArchiveDoesNotWriteAnything` | PASS |
@@ -47,7 +56,7 @@ Registry-mutating tests use scoped cleanup so their HKCU values are removed even
 
 - `powershell -ExecutionPolicy Bypass -File .\tests\run-tests.ps1` — normalization and Pts suites passed.
 - `powershell -ExecutionPolicy Bypass -File .\tests\run-tests.ps1 -Coverage` — suites passed; the extracted normalization module reported **94.85% line coverage**, **100% branches executed**, and **82% branches taken at least once**.
-- `powershell -ExecutionPolicy Bypass -File .\build.ps1` — production executable linked successfully with `-Wall -Wextra -Wpedantic` and no warnings.
+- Production-equivalent build linked successfully with `-Wall -Wextra -Wpedantic` and no warnings. Validation used `ToolType.verify.exe` because an existing running `ToolType.exe` process held the normal output path open.
 - `git diff --check` and PowerShell parser checks — passed.
 
-Coverage percentages above apply to `text_normalization.cpp`; the Pts suite is a native Win32 regression/integration suite and does not claim a separate line-coverage percentage. Real-machine performance still depends on archive size, storage, antivirus scanning, and the number of installed fonts, but the implementation removes redundant payload scans/writes and keeps the dialog message queue serviced during long loops.
+Coverage percentages above apply to `text_normalization.cpp`; the Pts suite is a native Win32 regression/integration suite and does not claim a separate line-coverage percentage. Real-machine performance still depends on archive size, storage, antivirus scanning, and the number of installed fonts. A single blocking Windows/font API call cannot be interrupted internally, so `Hủy` takes effect immediately after that safe call returns; the UI thread itself remains available because the call runs on the worker.

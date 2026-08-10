@@ -28,6 +28,8 @@ Font được restore vào `%LOCALAPPDATA%\Microsoft\Windows\Fonts`, không cầ
 
 Nếu máy có nhiều Photoshop version, backup settings/backup kết hợp sẽ yêu cầu chọn đúng một version đang cài. Khi restore, ToolType cho chọn version nguồn trong `.afang` (nếu archive có nhiều version) và version Photoshop đích đang có trên máy; nguồn và đích có thể khác nhau.
 
+Backup và restore chạy trên worker riêng nên popup vẫn có thể repaint/di chuyển trong lúc đọc, giải nén, ghi hoặc đăng ký font. Khi thao tác đang chạy, nút `Đóng` đổi thành `Hủy`: backup bị hủy sẽ xóa file `.afang` chưa hoàn tất; restore bị hủy sẽ dừng trước bước/file tiếp theo và giữ lại những file đã restore xong trước đó.
+
 ## Build local
 
 Cần MinGW-w64/MSYS2 có `g++.exe`, `windres.exe` và zlib. Script sẽ tự tìm compiler trong PATH hoặc các đường dẫn phổ biến:

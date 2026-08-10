@@ -26,6 +26,37 @@ struct BackgroundUiProbe {
     DWORD workerThreadId = 0;
 };
 
+struct BackgroundTestResources {
+    HWND window = nullptr;
+    HANDLE worker = nullptr;
+    HANDLE workerStarted = nullptr;
+    HANDLE releaseWorker = nullptr;
+    PtsCancellationHandle cancellation;
+
+    ~BackgroundTestResources() {
+        RequestPtsCancellation(cancellation);
+        if (releaseWorker) SetEvent(releaseWorker);
+        if (worker) {
+            WaitForSingleObject(worker, 3000);
+            CloseHandle(worker);
+        }
+        if (window) {
+            MSG pending{};
+            while (PeekMessageW(&pending, window, WM_APP_PTS_PROGRESS,
+                                WM_APP_PTS_OPERATION_DONE, PM_REMOVE)) {
+                if (pending.message == WM_APP_PTS_PROGRESS) {
+                    delete reinterpret_cast<PtsProgressMessage*>(pending.lParam);
+                } else if (pending.message == WM_APP_PTS_OPERATION_DONE) {
+                    delete reinterpret_cast<PtsBackgroundResult*>(pending.lParam);
+                }
+            }
+            DestroyWindow(window);
+        }
+        if (workerStarted) CloseHandle(workerStarted);
+        if (releaseWorker) CloseHandle(releaseWorker);
+    }
+};
+
 constexpr UINT kBackgroundUiHeartbeat = WM_APP + 120;
 
 LRESULT CALLBACK BackgroundUiProbeWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -244,13 +275,15 @@ void TestPtsBackgroundTaskKeepsUiThreadResponsive() {
            "could not register background UI probe window");
 
     BackgroundUiProbe probe{};
-    HWND window = CreateWindowExW(0, className, L"", 0, 0, 0, 0, 0, HWND_MESSAGE,
-                                  nullptr, windowClass.hInstance, &probe);
-    Expect(window != nullptr, "could not create background UI probe window");
+    BackgroundTestResources resources{};
+    resources.window = CreateWindowExW(0, className, L"", 0, 0, 0, 0, 0, HWND_MESSAGE,
+                                       nullptr, windowClass.hInstance, &probe);
+    Expect(resources.window != nullptr, "could not create background UI probe window");
 
-    HANDLE workerStarted = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    HANDLE releaseWorker = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    Expect(workerStarted && releaseWorker, "could not create background task test events");
+    resources.workerStarted = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    resources.releaseWorker = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    Expect(resources.workerStarted && resources.releaseWorker,
+           "could not create background task test events");
 
     DWORD operationThreadId = 0;
     PtsBackgroundOperation operation = [&](const PtsProgressCallback& progress,
@@ -258,45 +291,40 @@ void TestPtsBackgroundTaskKeepsUiThreadResponsive() {
                                             std::wstring& summary,
                                             std::wstring&) {
         operationThreadId = GetCurrentThreadId();
-        SetEvent(workerStarted);
-        WaitForSingleObject(releaseWorker, INFINITE);
+        SetEvent(resources.workerStarted);
+        WaitForSingleObject(resources.releaseWorker, INFINITE);
         progress(42, L"Đang restore font trong worker...");
         summary = L"Hoàn tất background test.";
         return true;
     };
 
-    HANDLE worker = nullptr;
-    PtsCancellationHandle cancellation = CreatePtsCancellationHandle();
+    resources.cancellation = CreatePtsCancellationHandle();
     std::wstring error;
-    Expect(StartPtsBackgroundTask(window, operation, cancellation, worker, error),
+    Expect(StartPtsBackgroundTask(resources.window, operation, resources.cancellation,
+                                  resources.worker, error),
            "could not start Pts background task");
-    Expect(WaitForSingleObject(workerStarted, 2000) == WAIT_OBJECT_0,
+    Expect(WaitForSingleObject(resources.workerStarted, 2000) == WAIT_OBJECT_0,
            "Pts background task did not start");
     Expect(operationThreadId != GetCurrentThreadId(),
            "Pts operation still ran on the UI thread");
-    Expect(WaitForSingleObject(worker, 0) == WAIT_TIMEOUT,
+    Expect(WaitForSingleObject(resources.worker, 0) == WAIT_TIMEOUT,
            "Pts background task unexpectedly completed before release");
 
-    PostMessageW(window, kBackgroundUiHeartbeat, 0, 0);
+    PostMessageW(resources.window, kBackgroundUiHeartbeat, 0, 0);
     Expect(PumpMessagesUntil(probe.heartbeatReceived, 1000),
            "UI thread could not process messages while Pts task was running");
     Expect(!probe.completionReceived,
            "Pts task completed before the slow operation was released");
 
-    SetEvent(releaseWorker);
+    SetEvent(resources.releaseWorker);
     Expect(PumpMessagesUntil(probe.completionReceived, 2000),
            "Pts background completion message was not delivered");
     Expect(probe.progressReceived, "Pts background progress message was not delivered");
     Expect(probe.operationSucceeded, "Pts background operation reported failure");
     Expect(probe.workerThreadId == operationThreadId,
            "Pts completion did not identify the worker thread");
-    Expect(WaitForSingleObject(worker, 2000) == WAIT_OBJECT_0,
+    Expect(WaitForSingleObject(resources.worker, 2000) == WAIT_OBJECT_0,
            "Pts background worker did not exit");
-
-    CloseHandle(worker);
-    CloseHandle(workerStarted);
-    CloseHandle(releaseWorker);
-    DestroyWindow(window);
 }
 
 void TestPtsBackgroundTaskCanBeCancelled() {
@@ -308,39 +336,38 @@ void TestPtsBackgroundTaskCanBeCancelled() {
     RegisterClassW(&windowClass);
 
     BackgroundUiProbe probe{};
-    HWND window = CreateWindowExW(0, className, L"", 0, 0, 0, 0, 0, HWND_MESSAGE,
-                                  nullptr, windowClass.hInstance, &probe);
-    Expect(window != nullptr, "could not create cancellation probe window");
+    BackgroundTestResources resources{};
+    resources.window = CreateWindowExW(0, className, L"", 0, 0, 0, 0, 0, HWND_MESSAGE,
+                                       nullptr, windowClass.hInstance, &probe);
+    Expect(resources.window != nullptr, "could not create cancellation probe window");
 
-    HANDLE workerStarted = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    Expect(workerStarted != nullptr, "could not create cancellation start event");
+    resources.workerStarted = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    Expect(resources.workerStarted != nullptr, "could not create cancellation start event");
     PtsBackgroundOperation operation = [&](const PtsProgressCallback&,
                                             const PtsCancellationCallback& cancelled,
                                             std::wstring&,
                                             std::wstring& error) {
-        SetEvent(workerStarted);
+        SetEvent(resources.workerStarted);
         while (!cancelled()) Sleep(1);
         error = L"Đã hủy thao tác Pts.";
         return false;
     };
 
-    PtsCancellationHandle cancellation = CreatePtsCancellationHandle();
-    HANDLE worker = nullptr;
+    resources.cancellation = CreatePtsCancellationHandle();
     std::wstring error;
-    Expect(StartPtsBackgroundTask(window, operation, cancellation, worker, error),
+    Expect(StartPtsBackgroundTask(resources.window, operation, resources.cancellation,
+                                  resources.worker, error),
            "could not start cancellable Pts task");
-    Expect(WaitForSingleObject(workerStarted, 2000) == WAIT_OBJECT_0,
+    Expect(WaitForSingleObject(resources.workerStarted, 2000) == WAIT_OBJECT_0,
            "cancellable Pts task did not start");
-    RequestPtsCancellation(cancellation);
+    RequestPtsCancellation(resources.cancellation);
     Expect(PumpMessagesUntil(probe.completionReceived, 2000),
            "cancelled Pts task did not report completion");
     Expect(probe.operationCancelled, "Pts completion did not report cancellation");
     Expect(!probe.operationSucceeded, "cancelled Pts task incorrectly reported success");
 
-    WaitForSingleObject(worker, 2000);
-    CloseHandle(worker);
-    CloseHandle(workerStarted);
-    DestroyWindow(window);
+    Expect(WaitForSingleObject(resources.worker, 2000) == WAIT_OBJECT_0,
+           "cancelled Pts worker did not exit");
 }
 
 void TestCrossVersionMappingAndCs6Aliases() {
@@ -571,8 +598,8 @@ void TestCancelledBackupDeletesIncompleteArchive() {
     }
 
     bool cancelNow = false;
-    auto progress = [&](int percent, const std::wstring&) {
-        if (percent >= 20) cancelNow = true;
+    auto progress = [&](int, const std::wstring& message) {
+        if (message.find(L"Đang nén") != std::wstring::npos) cancelNow = true;
     };
     PtsCancellationCallback cancelled = [&] { return cancelNow; };
     fs::path archive = root / L"cancelled.afang";
