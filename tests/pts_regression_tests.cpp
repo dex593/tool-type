@@ -497,14 +497,24 @@ void TestCrossVersionArchiveRestore() {
     options.targetAppDataRelativeRoot = L"Adobe\\Adobe Photoshop CS6";
     options.targetLocalAppDataRelativeRoot = L"Adobe\\Adobe Photoshop CS6";
     options.archiveHasSettings = true;
+    fs::path settingsRoot = root / L"Roaming" / L"Adobe" / L"Adobe Photoshop CS6" /
+                            L"Adobe Photoshop CS6 Settings";
     std::wstring summary;
     std::wstring error;
     auto progress = [](int, const std::wstring&) {};
-    Expect(RestorePtsBackupArchive(archive.wstring(), options, progress, summary, error),
+    bool registryUpdateRequested = false;
+    auto registryUpdater = [&](const std::wstring& label,
+                               const std::set<std::wstring>& settingsFolders) {
+        registryUpdateRequested = LowerWide(label) == L"adobe photoshop cs6" &&
+                                  settingsFolders.count(settingsRoot.wstring()) > 0;
+        return registryUpdateRequested ? 1u : 0u;
+    };
+    Expect(RestorePtsBackupArchive(archive.wstring(), options, progress, summary, error,
+                                   PtsCancellationCallback{}, registryUpdater),
            "cross-version archive restore failed");
+    Expect(registryUpdateRequested,
+           "cross-version restore did not request the active Photoshop settings path update");
 
-    fs::path settingsRoot = root / L"Roaming" / L"Adobe" / L"Adobe Photoshop CS6" /
-                            L"Adobe Photoshop CS6 Settings";
     fs::path primary = settingsRoot / L"WorkSpaces" / L"Editing.psw";
     fs::path modified = settingsRoot / L"WorkSpaces (Modified)" / L"Editing.psw";
     fs::path extensionless = settingsRoot / L"WorkSpaces" / L"Editing";
