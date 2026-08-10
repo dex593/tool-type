@@ -2812,9 +2812,8 @@ std::vector<std::wstring> BuildPhotoshopSettingsRestoreRelativePaths(
 
     if (ShouldRewritePhotoshopVersionLabel(sourceLabel, targetLabel)) {
         AddPhotoshopVersionFilenameAliases(paths, primaryPath, targetLabel);
+        AddWorkspaceCompatibilityAliases(paths, primaryPath, targetLabel);
     }
-
-    AddWorkspaceCompatibilityAliases(paths, primaryPath, targetLabel);
     return paths;
 }
 
