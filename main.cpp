@@ -3922,6 +3922,84 @@ std::wstring RestoreTargetRootForToken(const PtsRestoreOptions& options,
     return L"";
 }
 
+bool CollectPtsPrimarySettingsDestinations(
+    const std::wstring& path, const PtsRestoreOptions& options,
+    std::set<std::wstring>& destinations, std::wstring& error,
+    const PtsCancellationCallback& cancelled = {}) {
+    destinations.clear();
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                              nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        error = L"Không mở được file .afang để lập kế hoạch restore.";
+        return false;
+    }
+
+    uint32_t count = 0;
+    if (!ReadPtsArchiveHeader(file, count, error)) {
+        CloseHandle(file);
+        return false;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        if (cancelled && cancelled()) {
+            CloseHandle(file);
+            error = L"Đã hủy lập kế hoạch restore Pts.";
+            return false;
+        }
+
+        uint8_t kindByte = 0;
+        std::wstring rootToken;
+        std::wstring relativePath;
+        std::wstring displayName;
+        uint64_t originalSize = 0;
+        uint64_t storedSize = 0;
+        uint8_t method = 0;
+        if (!ReadPtsArchiveEntryMetadata(file, kindByte, rootToken, relativePath, displayName,
+                                         originalSize, storedSize, method, error)) {
+            CloseHandle(file);
+            return false;
+        }
+
+        if (kindByte == static_cast<uint8_t>(PtsEntryKind::PhotoshopSetting)) {
+            std::wstring sourceRelativeRoot;
+            std::wstring sourceLabel;
+            if (!ExtractPhotoshopVersionInfo(relativePath, sourceRelativeRoot, sourceLabel)) {
+                CloseHandle(file);
+                error = L"Không xác định được version của settings trong .afang.";
+                return false;
+            }
+            const std::wstring sourceVersionKey =
+                PtsPhotoshopVersionKey(rootToken, sourceRelativeRoot);
+            if (!options.HasSourceFilter() ||
+                options.sourceVersionKeys.count(sourceVersionKey) > 0) {
+                std::wstring destinationRelativePath = relativePath;
+                if (options.HasTargetMapping()) {
+                    const std::wstring targetRoot =
+                        RestoreTargetRootForToken(options, rootToken);
+                    if (!BuildMappedPhotoshopSettingsRelativePath(
+                            relativePath, sourceRelativeRoot, targetRoot, sourceLabel,
+                            options.targetVersionLabel, destinationRelativePath)) {
+                        CloseHandle(file);
+                        error = L"Không map được settings sang Photoshop version đã chọn.";
+                        return false;
+                    }
+                }
+                destinations.insert(
+                    LowerWide(rootToken + L"\\" + destinationRelativePath));
+            }
+        }
+
+        if (!SkipFileBytes(file, storedSize)) {
+            CloseHandle(file);
+            error = L"File .afang bị thiếu dữ liệu.";
+            return false;
+        }
+    }
+
+    CloseHandle(file);
+    return true;
+}
+
 bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& options,
                               const PtsProgressCallback& progress,
                               std::wstring& summary, std::wstring& error,
@@ -3940,6 +4018,13 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
     }
     if (archiveHasSettings && IsPhotoshopRunning()) {
         error = L"Photoshop đang chạy. Hãy đóng Photoshop trước khi restore settings.";
+        return false;
+    }
+
+    std::set<std::wstring> primarySettingsDestinations;
+    if (options.HasTargetMapping() &&
+        !CollectPtsPrimarySettingsDestinations(path, options, primarySettingsDestinations,
+                                               error, cancelled)) {
         return false;
     }
 
@@ -3974,7 +4059,6 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
     bool wroteAnyDestination = false;
     std::set<std::wstring> restoredSettingsRoots;
     std::set<std::wstring> targetSettingsFoldersForRegistry;
-    std::set<std::wstring> primarySettingsDestinations;
     std::vector<RestoredUserFont> fontsToRegister;
     auto cancellationError = [&] {
         return restored > 0 || wroteAnyDestination
@@ -4147,10 +4231,6 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
             error = L"Không tạo được đường dẫn restore Photoshop settings.";
             return false;
         }
-
-        const std::wstring primaryDestinationKey =
-            LowerWide(rootToken + L"\\" + destinationRelativePaths.front());
-        primarySettingsDestinations.insert(primaryDestinationKey);
 
         bool convertedWorkspaceForEntry = false;
         for (size_t pathIndex = 0; pathIndex < destinationRelativePaths.size(); ++pathIndex) {
