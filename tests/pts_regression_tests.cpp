@@ -22,6 +22,7 @@ struct BackgroundUiProbe {
     bool progressReceived = false;
     bool completionReceived = false;
     bool operationSucceeded = false;
+    bool operationCancelled = false;
     DWORD workerThreadId = 0;
 };
 
@@ -51,6 +52,7 @@ LRESULT CALLBACK BackgroundUiProbeWndProc(HWND hwnd, UINT message, WPARAM wParam
         if (result) {
             probe->completionReceived = true;
             probe->operationSucceeded = result->ok;
+            probe->operationCancelled = result->cancelled;
             probe->workerThreadId = result->workerThreadId;
         }
         delete result;
@@ -252,6 +254,7 @@ void TestPtsBackgroundTaskKeepsUiThreadResponsive() {
 
     DWORD operationThreadId = 0;
     PtsBackgroundOperation operation = [&](const PtsProgressCallback& progress,
+                                            const PtsCancellationCallback&,
                                             std::wstring& summary,
                                             std::wstring&) {
         operationThreadId = GetCurrentThreadId();
@@ -263,8 +266,9 @@ void TestPtsBackgroundTaskKeepsUiThreadResponsive() {
     };
 
     HANDLE worker = nullptr;
+    PtsCancellationHandle cancellation = CreatePtsCancellationHandle();
     std::wstring error;
-    Expect(StartPtsBackgroundTask(window, operation, worker, error),
+    Expect(StartPtsBackgroundTask(window, operation, cancellation, worker, error),
            "could not start Pts background task");
     Expect(WaitForSingleObject(workerStarted, 2000) == WAIT_OBJECT_0,
            "Pts background task did not start");
@@ -292,6 +296,50 @@ void TestPtsBackgroundTaskKeepsUiThreadResponsive() {
     CloseHandle(worker);
     CloseHandle(workerStarted);
     CloseHandle(releaseWorker);
+    DestroyWindow(window);
+}
+
+void TestPtsBackgroundTaskCanBeCancelled() {
+    const wchar_t* className = L"ToolTypePtsBackgroundUiProbe";
+    WNDCLASSW windowClass{};
+    windowClass.lpfnWndProc = BackgroundUiProbeWndProc;
+    windowClass.hInstance = GetModuleHandleW(nullptr);
+    windowClass.lpszClassName = className;
+    RegisterClassW(&windowClass);
+
+    BackgroundUiProbe probe{};
+    HWND window = CreateWindowExW(0, className, L"", 0, 0, 0, 0, 0, HWND_MESSAGE,
+                                  nullptr, windowClass.hInstance, &probe);
+    Expect(window != nullptr, "could not create cancellation probe window");
+
+    HANDLE workerStarted = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    Expect(workerStarted != nullptr, "could not create cancellation start event");
+    PtsBackgroundOperation operation = [&](const PtsProgressCallback&,
+                                            const PtsCancellationCallback& cancelled,
+                                            std::wstring&,
+                                            std::wstring& error) {
+        SetEvent(workerStarted);
+        while (!cancelled()) Sleep(1);
+        error = L"Đã hủy thao tác Pts.";
+        return false;
+    };
+
+    PtsCancellationHandle cancellation = CreatePtsCancellationHandle();
+    HANDLE worker = nullptr;
+    std::wstring error;
+    Expect(StartPtsBackgroundTask(window, operation, cancellation, worker, error),
+           "could not start cancellable Pts task");
+    Expect(WaitForSingleObject(workerStarted, 2000) == WAIT_OBJECT_0,
+           "cancellable Pts task did not start");
+    RequestPtsCancellation(cancellation);
+    Expect(PumpMessagesUntil(probe.completionReceived, 2000),
+           "cancelled Pts task did not report completion");
+    Expect(probe.operationCancelled, "Pts completion did not report cancellation");
+    Expect(!probe.operationSucceeded, "cancelled Pts task incorrectly reported success");
+
+    WaitForSingleObject(worker, 2000);
+    CloseHandle(worker);
+    CloseHandle(workerStarted);
     DestroyWindow(window);
 }
 
@@ -654,6 +702,7 @@ int main() {
         TestCompressionRoundTrip();
         TestArchiveInspectionReportsProgress();
         TestPtsBackgroundTaskKeepsUiThreadResponsive();
+        TestPtsBackgroundTaskCanBeCancelled();
         TestCrossVersionMappingAndCs6Aliases();
         TestFontCollisionPath();
         TestSettingsBackupArchive();
