@@ -150,6 +150,22 @@ void Expect(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+void TestPtsDialogLoopPreservesQuitAndDestroysWindow() {
+    HWND window = CreateWindowExW(0, L"STATIC", L"Pts loop probe", WS_POPUP,
+                                  0, 0, 10, 10, nullptr, nullptr,
+                                  GetModuleHandleW(nullptr), nullptr);
+    Expect(window != nullptr, "could not create Pts loop probe window");
+    PostQuitMessage(73);
+    Expect(!RunPtsDialogMessageLoop(window),
+           "Pts dialog loop did not report application shutdown");
+    Expect(!IsWindow(window), "Pts dialog survived WM_QUIT with stack state about to expire");
+
+    MSG quit{};
+    Expect(PeekMessageW(&quit, nullptr, WM_QUIT, WM_QUIT, PM_REMOVE) &&
+               quit.message == WM_QUIT && quit.wParam == 73,
+           "Pts dialog loop swallowed the outer application WM_QUIT");
+}
+
 void WriteTestArchive(const std::wstring& path,
                       const std::vector<TestArchiveEntry>& entries) {
     HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
@@ -1020,6 +1036,7 @@ int main() {
         TestArchiveInspectionReportsProgress();
         TestPtsBackgroundTaskKeepsUiThreadResponsive();
         TestPtsBackgroundTaskCanBeCancelled();
+        TestPtsDialogLoopPreservesQuitAndDestroysWindow();
         TestCrossVersionMappingAndCs6Aliases();
         TestFontCollisionPath();
         TestSettingsBackupArchive();
