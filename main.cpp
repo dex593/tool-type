@@ -3974,6 +3974,7 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
     bool wroteAnyDestination = false;
     std::set<std::wstring> restoredSettingsRoots;
     std::set<std::wstring> targetSettingsFoldersForRegistry;
+    std::set<std::wstring> primarySettingsDestinations;
     std::vector<RestoredUserFont> fontsToRegister;
     auto cancellationError = [&] {
         return restored > 0 || wroteAnyDestination
@@ -4147,8 +4148,18 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
             return false;
         }
 
+        const std::wstring primaryDestinationKey =
+            LowerWide(rootToken + L"\\" + destinationRelativePaths.front());
+        primarySettingsDestinations.insert(primaryDestinationKey);
+
         bool convertedWorkspaceForEntry = false;
-        for (const auto& targetRelativePath : destinationRelativePaths) {
+        for (size_t pathIndex = 0; pathIndex < destinationRelativePaths.size(); ++pathIndex) {
+            const auto& targetRelativePath = destinationRelativePaths[pathIndex];
+            if (pathIndex > 0 &&
+                primarySettingsDestinations.count(
+                    LowerWide(rootToken + L"\\" + targetRelativePath)) > 0) {
+                continue;
+            }
             if (cancellationRequested()) {
                 CloseHandle(file);
                 error = cancellationError();
@@ -4182,6 +4193,7 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
                 return false;
             }
             wroteAnyDestination = true;
+            if (pathIndex > 0) ++settingsCompatibilityAliases;
 
             if (options.HasTargetMapping() && rootToken == L"APPDATA") {
                 std::wstring settingsFolderRelativePath;
@@ -4194,10 +4206,6 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
         }
 
         if (convertedWorkspaceForEntry) ++workspaceCompatibilityConversions;
-        if (destinationRelativePaths.size() > 1) {
-            settingsCompatibilityAliases +=
-                static_cast<uint32_t>(destinationRelativePaths.size() - 1);
-        }
         std::wstring restoredRoot;
         std::wstring restoredLabel;
         if (ExtractPhotoshopVersionInfo(destinationRelativePath, restoredRoot, restoredLabel)) {
