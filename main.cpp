@@ -807,6 +807,30 @@ struct PtsBackgroundTaskContext {
     PtsCancellationHandle cancellation;
 };
 
+bool RunPtsDialogMessageLoop(HWND dialog) {
+    MSG message{};
+    BOOL getMessageResult = TRUE;
+    while (IsWindow(dialog) &&
+           (getMessageResult = GetMessageW(&message, nullptr, 0, 0)) > 0) {
+        if (!IsDialogMessageW(dialog, &message)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+
+    if (getMessageResult == 0) {
+        int exitCode = static_cast<int>(message.wParam);
+        if (IsWindow(dialog)) DestroyWindow(dialog);
+        PostQuitMessage(exitCode);
+        return false;
+    }
+    if (getMessageResult < 0) {
+        if (IsWindow(dialog)) DestroyWindow(dialog);
+        return false;
+    }
+    return true;
+}
+
 DWORD WINAPI PtsBackgroundTaskThreadProc(void* parameter) {
     std::unique_ptr<PtsBackgroundTaskContext> context(
         static_cast<PtsBackgroundTaskContext*>(parameter));
@@ -6066,13 +6090,7 @@ private:
         SetFocus(state.edit);
         SendMessageW(state.edit, EM_SETSEL, 0, -1);
 
-        MSG msg{};
-        while (IsWindow(dialog) && GetMessageW(&msg, nullptr, 0, 0) > 0) {
-            if (!IsDialogMessageW(dialog, &msg)) {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-        }
+        RunPtsDialogMessageLoop(dialog);
 
         EnableWindow(hwnd_, TRUE);
         SetForegroundWindow(hwnd_);
