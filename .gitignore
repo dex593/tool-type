@@ -4,4 +4,8 @@ resource.res
 *.o
 *.obj
 *.log
+tests/*.exe
+tests/*.gcda
+tests/*.gcno
+tests/*.gcov
 .omx/
