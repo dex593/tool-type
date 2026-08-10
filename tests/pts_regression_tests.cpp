@@ -611,6 +611,22 @@ void TestCancelledBackupDeletesIncompleteArchive() {
     Expect(!fs::exists(archive), "cancelled backup left an incomplete .afang file");
     Expect(LowerWide(error).find(L"hủy") != std::wstring::npos,
            "cancelled backup did not return a cancellation message");
+
+    {
+        std::ofstream existingBackup(archive, std::ios::binary);
+        existingBackup << "previous-valid-backup";
+    }
+    cancelNow = false;
+    summary.clear();
+    error.clear();
+    Expect(!CreatePtsBackupArchive(archive.wstring(), true, false, options, progress,
+                                   summary, error, cancelled),
+           "cancelled overwrite backup incorrectly reported success");
+    std::ifstream preservedBackup(archive, std::ios::binary);
+    std::string preservedBytes((std::istreambuf_iterator<char>(preservedBackup)),
+                               std::istreambuf_iterator<char>());
+    Expect(preservedBytes == "previous-valid-backup",
+           "cancelled backup destroyed the previous archive");
     fs::remove_all(root, ignored);
 }
 
