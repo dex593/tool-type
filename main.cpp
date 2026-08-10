@@ -762,9 +762,16 @@ using PtsSettingsRegistryUpdateCallback =
 using PtsReplaceFileCallback =
     std::function<BOOL(const std::wstring&, const std::wstring&,
                        const std::wstring&, DWORD)>;
+using PtsCommitCallback = std::function<bool()>;
+
+enum class PtsCancellationPhase : int {
+    Running,
+    CancelRequested,
+    CommitStarted,
+};
 
 struct PtsCancellationState {
-    std::atomic_bool requested{false};
+    std::atomic<int> phase{static_cast<int>(PtsCancellationPhase::Running)};
 };
 
 using PtsCancellationHandle = std::shared_ptr<PtsCancellationState>;
@@ -773,12 +780,32 @@ PtsCancellationHandle CreatePtsCancellationHandle() {
     return std::make_shared<PtsCancellationState>();
 }
 
-void RequestPtsCancellation(const PtsCancellationHandle& cancellation) {
-    if (cancellation) cancellation->requested.store(true, std::memory_order_release);
+bool RequestPtsCancellation(const PtsCancellationHandle& cancellation) {
+    if (!cancellation) return false;
+    int expected = static_cast<int>(PtsCancellationPhase::Running);
+    if (cancellation->phase.compare_exchange_strong(
+            expected, static_cast<int>(PtsCancellationPhase::CancelRequested),
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return true;
+    }
+    return expected == static_cast<int>(PtsCancellationPhase::CancelRequested);
 }
 
 bool IsPtsCancellationRequested(const PtsCancellationHandle& cancellation) {
-    return cancellation && cancellation->requested.load(std::memory_order_acquire);
+    return cancellation &&
+           cancellation->phase.load(std::memory_order_acquire) ==
+               static_cast<int>(PtsCancellationPhase::CancelRequested);
+}
+
+bool BeginPtsCommit(const PtsCancellationHandle& cancellation) {
+    if (!cancellation) return false;
+    int expected = static_cast<int>(PtsCancellationPhase::Running);
+    if (cancellation->phase.compare_exchange_strong(
+            expected, static_cast<int>(PtsCancellationPhase::CommitStarted),
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return true;
+    }
+    return expected == static_cast<int>(PtsCancellationPhase::CommitStarted);
 }
 
 struct PtsProgressMessage {
@@ -795,7 +822,7 @@ struct PtsBackgroundResult {
 };
 
 using PtsBackgroundOperation = std::function<bool(
-    const PtsProgressCallback&, const PtsCancellationCallback&,
+    const PtsProgressCallback&, const PtsCancellationCallback&, const PtsCommitCallback&,
     std::wstring&, std::wstring&)>;
 
 enum class PtsOperationKind {
@@ -868,9 +895,13 @@ DWORD WINAPI PtsBackgroundTaskThreadProc(void* parameter) {
     PtsCancellationCallback cancelled = [cancellation] {
         return IsPtsCancellationRequested(cancellation);
     };
+    PtsCommitCallback beginCommit = [cancellation] {
+        return BeginPtsCommit(cancellation);
+    };
 
     try {
-        result->ok = context->operation(progress, cancelled, result->summary, result->error);
+        result->ok = context->operation(progress, cancelled, beginCommit,
+                                        result->summary, result->error);
     } catch (...) {
         result->ok = false;
         result->error = L"Lỗi không xác định trong thao tác Pts.";
@@ -2114,7 +2145,8 @@ bool CreatePtsBackupArchive(const std::wstring& path, bool includeSettings, bool
                              const PtsProgressCallback& progress, std::wstring& summary,
                              std::wstring& error,
                              const PtsCancellationCallback& cancelled = {},
-                             const PtsPhotoshopRunningCallback& photoshopRunning = {}) {
+                             const PtsPhotoshopRunningCallback& photoshopRunning = {},
+                             const PtsCommitCallback& beginCommit = {}) {
     std::vector<PtsBackupItem> items;
     auto cancellationRequested = [&] { return cancelled && cancelled(); };
     if (includeSettings &&
@@ -2228,6 +2260,13 @@ bool CreatePtsBackupArchive(const std::wstring& path, bool includeSettings, bool
     if (!ok || writtenEntries == 0) {
         DeleteFileW(tempPath.c_str());
         error = L"Lỗi khi ghi file backup .afang.";
+        return false;
+    }
+
+    if ((beginCommit && !beginCommit()) || (!beginCommit && cancellationRequested())) {
+        DeleteFileW(tempPath.c_str());
+        error = L"Đã hủy backup Pts trước khi thay file backup đích; "
+                L"backup cũ (nếu có) vẫn được giữ nguyên.";
         return false;
     }
 
@@ -6515,9 +6554,20 @@ private:
 
     void RequestPtsOperationCancellation(PtsDialogState* state) {
         if (!state || !state->busy || state->cancelRequested) return;
+        PtsCancellationHandle cancellation =
+            std::static_pointer_cast<PtsCancellationState>(state->cancellation);
+        if (!RequestPtsCancellation(cancellation)) {
+            if (state->close) {
+                SetWindowTextW(state->close, L"Đang hoàn tất...");
+                EnableWindow(state->close, FALSE);
+            }
+            UpdatePtsProgress(state, state->progress,
+                              L"Đang thay file backup đích; không thể hủy ở bước cuối.",
+                              false);
+            SetStatus(L"Pts: đang hoàn tất thao tác...");
+            return;
+        }
         state->cancelRequested = true;
-        RequestPtsCancellation(
-            std::static_pointer_cast<PtsCancellationState>(state->cancellation));
         if (state->close) {
             SetWindowTextW(state->close, L"Đang hủy...");
             EnableWindow(state->close, FALSE);
@@ -6850,10 +6900,12 @@ private:
             [path, includeSettings, includeFonts, backupOptions](
                 const PtsProgressCallback& progress,
                 const PtsCancellationCallback& cancelled,
+                const PtsCommitCallback& beginCommit,
                 std::wstring& summary, std::wstring& error) {
                 auto typedOptions = std::static_pointer_cast<PtsBackupOptions>(backupOptions);
                 return CreatePtsBackupArchive(path, includeSettings, includeFonts, *typedOptions,
-                                              progress, summary, error, cancelled);
+                                              progress, summary, error, cancelled,
+                                              PtsPhotoshopRunningCallback{}, beginCommit);
             };
         StartPtsUiBackgroundOperation(state, PtsOperationKind::Backup, operation,
                                       L"Bắt đầu backup, có thể bấm Hủy bất kỳ lúc nào...");
@@ -6938,6 +6990,7 @@ private:
         PtsBackgroundOperation operation =
             [path, restoreOptions](const PtsProgressCallback& workerProgress,
                             const PtsCancellationCallback& workerCancelled,
+                            const PtsCommitCallback&,
                             std::wstring& summary, std::wstring& error) {
                 auto typedOptions = std::static_pointer_cast<PtsRestoreOptions>(restoreOptions);
                 return RestorePtsBackupArchive(path, *typedOptions, workerProgress,

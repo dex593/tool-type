@@ -436,6 +436,7 @@ void TestPtsBackgroundTaskKeepsUiThreadResponsive() {
     DWORD operationThreadId = 0;
     PtsBackgroundOperation operation = [&](const PtsProgressCallback& progress,
                                             const PtsCancellationCallback&,
+                                            const PtsCommitCallback&,
                                             std::wstring& summary,
                                             std::wstring&) {
         operationThreadId = GetCurrentThreadId();
@@ -493,6 +494,7 @@ void TestPtsBackgroundTaskCanBeCancelled() {
     Expect(resources.workerStarted != nullptr, "could not create cancellation start event");
     PtsBackgroundOperation operation = [&](const PtsProgressCallback&,
                                             const PtsCancellationCallback& cancelled,
+                                            const PtsCommitCallback&,
                                             std::wstring&,
                                             std::wstring& error) {
         SetEvent(resources.workerStarted);
