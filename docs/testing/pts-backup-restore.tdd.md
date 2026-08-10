@@ -25,6 +25,7 @@
 - Commit `1a2fa98` reproduced same-version CS6 workspace corruption: aliases made `WorkSpaces\Untitled-1` and `WorkSpaces (Modified)\Untitled-1` overwrite each other.
 - Commits `4d8bf6e`, `3e1665e`, and `f67029e` covered `WM_QUIT` preservation, documented `ReplaceFileW` partial-failure states 1176/1177, and the late cancellation/commit race.
 - Commit `762f732` reproduced the equivalent cross-version corruption when two distinct source workspace variants generated aliases for each other's primary target.
+- Commit `4f6980b` showed that incremental alias protection was insufficient: cancelling before the later primary entry left the earlier alias in that future primary path.
 
 ## GREEN implementation
 
@@ -42,6 +43,7 @@
 - Commit `fd2582a` limits workspace compatibility aliases to real cross-version restores, so same-version `WorkSpaces` and `WorkSpaces (Modified)` files retain their distinct bytes.
 - Commits `4077dea`, `ba43695`, and `a1e735b` preserve outer `WM_QUIT`, use a safety backup/rollback for `ReplaceFileW` 1176/1177, clear the temporary file attribute, and arbitrate `Hủy` versus the atomic commit point with a single-winner gate.
 - Commit `b2248d0` tracks primary workspace destinations during cross-version restore; a compatibility alias can no longer overwrite a primary entry already restored from the archive.
+- Commit `e571385` performs a seek-based metadata planning pass before the first write, so aliases are also blocked from every future primary path during cancelled or failed partial restores.
 - Windows path validation rejects traversal, empty/dot segments, control characters, trailing dot/space, and reserved device prefixes before the first period.
 
 ## Regression specification
@@ -60,6 +62,7 @@
 | Modern settings map to CS6 aliases/workspace layout | `TestCrossVersionMappingAndCs6Aliases`, `TestCrossVersionArchiveRestore` | PASS |
 | Same-version workspace variants keep their own bytes instead of overwriting through aliases | `TestSameVersionWorkspaceRestoreKeepsDistinctVariants` | PASS |
 | Cross-version workspace aliases cannot overwrite distinct primary workspace variants | `TestCrossVersionWorkspaceAliasesDoNotOverwritePrimaryEntries` | PASS |
+| Cancelled cross-version restore cannot leave an alias in a future primary workspace path | `TestCancelledCrossVersionRestoreDoesNotAliasOverFuturePrimary` | PASS |
 | Native restore tests request but do not write the real Photoshop Registry path | injected updater in `TestCrossVersionArchiveRestore` | PASS |
 | `WM_QUIT` destroys the Pts dialog and is reposted to the outer app loop | `TestPtsDialogLoopPreservesQuitAndDestroysWindow` | PASS |
 | Replace failures 1176/1177 restore the old destination; committed files lose the temporary attribute | `TestAtomicCommitPreservesDestinationAcrossReplaceFailures` | PASS |
