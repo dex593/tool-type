@@ -791,6 +791,29 @@ void TestSameVersionCs6WorkspaceRestoreKeepsNativeBytes() {
     fs::remove_all(root, ignored);
 }
 
+void TestCs6WorkspaceStructuralValidation() {
+    auto bytes = [](const std::string& text) {
+        return std::vector<uint8_t>(text.begin(), text.end());
+    };
+    const std::string validWithComment =
+        "<?xml version=\"1.0\"?><!-- example <photoshop-workspace> text -->"
+        "<photoshop-workspace version=\"1.0\"><workspace version=\"1\"/>"
+        "</photoshop-workspace>";
+    const std::string garbagePrefix =
+        "garbage<photoshop-workspace version=\"1.0\"><workspace version=\"1\"/>"
+        "</photoshop-workspace>";
+    const std::string mismatchedInnerTag =
+        "<photoshop-workspace version=\"1.0\"><workspace><frame>"
+        "</workspace></photoshop-workspace>";
+
+    Expect(IsStrictStandalonePhotoshopWorkspaceBytes(bytes(validWithComment)),
+           "valid CS6 workspace comment was rejected as corruption");
+    Expect(!IsStrictStandalonePhotoshopWorkspaceBytes(bytes(garbagePrefix)),
+           "CS6 workspace with prefix garbage was accepted");
+    Expect(!IsStrictStandalonePhotoshopWorkspaceBytes(bytes(mismatchedInnerTag)),
+           "CS6 workspace with mismatched inner tags was accepted");
+}
+
 void TestSameVersionCs6RestoreRepairsMalformedLegacyAlias() {
     namespace fs = std::filesystem;
     fs::path root = fs::temp_directory_path() / L"tooltype-pts-cs6-stale-alias";
@@ -850,6 +873,25 @@ void TestSameVersionCs6RestoreRepairsMalformedLegacyAlias() {
     repaired.close();
     Expect(repairedBytes == archivedModified,
            "malformed legacy workspace alias was left for CS6 to load");
+
+    const std::string validDistinctAlias =
+        "<photoshop-workspace version=\"1.0\"><workspace version=\"1\">"
+        "<frame name=\"keep-existing-layout\"/></workspace></photoshop-workspace>";
+    {
+        std::ofstream valid(staleAlias, std::ios::binary | std::ios::trunc);
+        valid << validDistinctAlias;
+    }
+    summary.clear();
+    error.clear();
+    Expect(RestorePtsBackupArchive(archive.wstring(), options, progress, summary, error,
+                                   PtsCancellationCallback{}, registryUpdater),
+           "same-version CS6 valid-alias preservation restore failed");
+    std::ifstream preserved(staleAlias, std::ios::binary);
+    std::string preservedBytes((std::istreambuf_iterator<char>(preserved)),
+                               std::istreambuf_iterator<char>());
+    preserved.close();
+    Expect(preservedBytes == validDistinctAlias,
+           "valid unplanned CS6 workspace counterpart was overwritten");
     fs::remove_all(root, ignored);
 }
 
@@ -1434,6 +1476,7 @@ int main() {
         TestCrossVersionArchiveRestore();
         TestSameVersionWorkspaceRestoreKeepsDistinctVariants();
         TestSameVersionCs6WorkspaceRestoreKeepsNativeBytes();
+        TestCs6WorkspaceStructuralValidation();
         TestSameVersionCs6RestoreRepairsMalformedLegacyAlias();
         TestCrossVersionWorkspaceAliasesDoNotOverwritePrimaryEntries();
         TestCancelledCrossVersionRestoreDoesNotAliasOverFuturePrimary();
