@@ -1087,7 +1087,7 @@ void TestCancelledCrossVersionRestoreDoesNotAliasOverFuturePrimary() {
     options.archiveHasSettings = true;
     bool cancelNow = false;
     auto progress = [&](int, const std::wstring& message) {
-        if (message.find(L"Đang restore file 2/2") != std::wstring::npos) cancelNow = true;
+        if (message.find(L"Đang khôi phục file 2/2") != std::wstring::npos) cancelNow = true;
     };
     PtsCancellationCallback cancelled = [&] { return cancelNow; };
     std::wstring summary;
@@ -1360,7 +1360,7 @@ void TestCancelledRestoreStopsBeforeNextFile() {
 
     bool cancelNow = false;
     auto progress = [&](int, const std::wstring& message) {
-        if (message.find(L"Đang restore file 2/2") != std::wstring::npos) cancelNow = true;
+        if (message.find(L"Đang khôi phục file 2/2") != std::wstring::npos) cancelNow = true;
     };
     PtsCancellationCallback cancelled = [&] { return cancelNow; };
     PtsRestoreOptions options{};
