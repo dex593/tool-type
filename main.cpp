@@ -757,6 +757,8 @@ struct PtsRestoreOptions {
 using PtsProgressCallback = std::function<void(int, const std::wstring&)>;
 using PtsCancellationCallback = std::function<bool()>;
 using PtsPhotoshopRunningCallback = std::function<bool()>;
+using PtsSettingsRegistryUpdateCallback =
+    std::function<uint32_t(const std::wstring&, const std::set<std::wstring>&)>;
 
 struct PtsCancellationState {
     std::atomic_bool requested{false};
@@ -3815,7 +3817,8 @@ std::wstring RestoreTargetRootForToken(const PtsRestoreOptions& options,
 bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& options,
                               const PtsProgressCallback& progress,
                               std::wstring& summary, std::wstring& error,
-                              const PtsCancellationCallback& cancelled = {}) {
+                              const PtsCancellationCallback& cancelled = {},
+                              const PtsSettingsRegistryUpdateCallback& registryUpdater = {}) {
     auto cancellationRequested = [&] { return cancelled && cancelled(); };
     if (cancellationRequested()) {
         error = L"Đã hủy restore Pts.";
@@ -4135,8 +4138,12 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
             return false;
         }
         progress(97, L"Đang cập nhật SettingsFilePath...");
-        registrySettingsPathUpdates = UpdatePhotoshopSettingsFilePathRegistry(
-            options.targetVersionLabel, targetSettingsFoldersForRegistry);
+        registrySettingsPathUpdates = registryUpdater
+                                          ? registryUpdater(options.targetVersionLabel,
+                                                            targetSettingsFoldersForRegistry)
+                                          : UpdatePhotoshopSettingsFilePathRegistry(
+                                                options.targetVersionLabel,
+                                                targetSettingsFoldersForRegistry);
     }
 
     if (cancellationRequested()) {
