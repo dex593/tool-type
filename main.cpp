@@ -756,6 +756,7 @@ struct PtsRestoreOptions {
 
 using PtsProgressCallback = std::function<void(int, const std::wstring&)>;
 using PtsCancellationCallback = std::function<bool()>;
+using PtsPhotoshopRunningCallback = std::function<bool()>;
 
 struct PtsCancellationState {
     std::atomic_bool requested{false};
@@ -2040,9 +2041,16 @@ bool CreatePtsBackupArchive(const std::wstring& path, bool includeSettings, bool
                              const PtsBackupOptions& options,
                              const PtsProgressCallback& progress, std::wstring& summary,
                              std::wstring& error,
-                             const PtsCancellationCallback& cancelled = {}) {
+                             const PtsCancellationCallback& cancelled = {},
+                             const PtsPhotoshopRunningCallback& photoshopRunning = {}) {
     std::vector<PtsBackupItem> items;
     auto cancellationRequested = [&] { return cancelled && cancelled(); };
+    if (includeSettings &&
+        (photoshopRunning ? photoshopRunning() : IsPhotoshopRunning())) {
+        error = L"Photoshop đang chạy. Hãy đóng Photoshop trước khi backup settings "
+                L"để workspace/layout hiện tại được ghi đầy đủ xuống đĩa.";
+        return false;
+    }
     if (includeSettings) {
         progress(5, options.selectedPhotoshopVersionLabel.empty()
                         ? L"Đang tìm settings Photoshop trong AppData..."
@@ -6738,6 +6746,17 @@ private:
 
     void RunPtsBackup(PtsDialogState* state, bool includeSettings, bool includeFonts,
                       const wchar_t* defaultName) {
+        if (includeSettings && IsPhotoshopRunning()) {
+            std::wstring error = L"Photoshop đang chạy. Hãy đóng Photoshop trước khi backup "
+                                 L"để workspace, layout và preferences hiện tại được lưu xuống đĩa.";
+            error = CompactPtsNotice(error);
+            UpdatePtsProgress(state, 0, error);
+            MessageBoxW(state ? state->dialog : hwnd_, error.c_str(), L"Pts backup",
+                        MB_OK | MB_ICONWARNING | MB_SETFOREGROUND |
+                            (topMost_ ? MB_TOPMOST : 0));
+            return;
+        }
+
         PtsBackupOptions options;
         if (!PrepareBackupOptions(state ? state->dialog : hwnd_, includeSettings, options)) {
             UpdatePtsProgress(state, state ? state->progress : 0, L"Đã hủy chọn phiên bản Photoshop.");
