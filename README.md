@@ -24,11 +24,13 @@ Mở `Expand` rồi chọn `Pts`. Popup hỗ trợ:
 - `Backup Settings + Fonts`: lưu cả hai nhóm vào một file `.afang`.
 - `Restore`: restore font cho user hiện tại và có thể map settings sang Photoshop version khác, gồm alias/workspace tương thích CS6.
 
-Font được restore vào `%LOCALAPPDATA%\Microsoft\Windows\Fonts`, không cần quyền admin. Nếu file font giống hệt đã tồn tại (kể cả dưới tên `-restored-N`), ToolType dùng lại file đó thay vì ghi thêm một bản trùng, giúp giảm I/O ở các lần restore sau. Khi restore settings, hãy đóng Photoshop để tránh Photoshop ghi đè lại preferences/layout lúc thoát.
+Font được restore vào `%LOCALAPPDATA%\Microsoft\Windows\Fonts`, không cần quyền admin. Nếu file font giống hệt đã tồn tại (kể cả dưới tên `-restored-N`), ToolType dùng lại file đó thay vì ghi thêm một bản trùng, giúp giảm I/O ở các lần restore sau.
+
+Phải đóng Photoshop trước cả backup lẫn restore settings. Khi backup, Photoshop cần thoát để ghi workspace/layout hiện tại xuống `Workspace Prefs.psp` và `WorkSpaces (Modified)`; ToolType sẽ chặn backup settings nếu `Photoshop.exe` còn chạy. Khi restore, việc đóng Photoshop ngăn nó ghi đè lại preferences/layout lúc thoát.
 
 Nếu máy có nhiều Photoshop version, backup settings/backup kết hợp sẽ yêu cầu chọn đúng một version đang cài. Khi restore, ToolType cho chọn version nguồn trong `.afang` (nếu archive có nhiều version) và version Photoshop đích đang có trên máy; nguồn và đích có thể khác nhau.
 
-Backup và restore chạy trên worker riêng nên popup vẫn có thể repaint/di chuyển trong lúc đọc, giải nén, ghi hoặc đăng ký font. Khi thao tác đang chạy, nút `Đóng` đổi thành `Hủy`: backup bị hủy sẽ xóa file `.afang` chưa hoàn tất; restore bị hủy sẽ dừng trước bước/file tiếp theo và giữ lại những file đã restore xong trước đó.
+Backup và restore chạy trên worker riêng nên popup vẫn có thể repaint/di chuyển trong lúc đọc, giải nén, ghi hoặc đăng ký font. Khi thao tác đang chạy, nút `Đóng` đổi thành `Hủy`: backup ghi vào file tạm cùng thư mục, nên khi hủy sẽ chỉ xóa bản tạm và giữ nguyên backup `.afang` cũ nếu đang ghi đè; restore bị hủy sẽ dừng trước bước/file tiếp theo và giữ lại những file đã restore xong trước đó. Sau khi backup bước vào thao tác thay file đích nguyên tử, nút sẽ chuyển sang `Đang hoàn tất...` và không nhận hủy muộn để tránh trạng thái UI mâu thuẫn với file đã commit.
 
 ## Build local
 

@@ -19,6 +19,11 @@
 - Additional filename tests rejected `CON.backup.ttf` and control characters; both represent Windows path rules not covered by the initial validator.
 - Commit `e99dca4` added a deterministic worker barrier: while the worker is deliberately blocked, the UI must process a heartbeat before completion. It failed to compile because no background-task transport existed.
 - Commit `09bb7b6` added the cancellation-token/result contract. Commit `33d1732` extended RED coverage to incomplete-backup cleanup and restore stopping before the next file.
+- Commit `80e0d5c` proved that cancelling an overwrite destroyed the previous `.afang`; the regression failed with `cancelled backup destroyed the previous archive`.
+- Commit `bdc0779` required a settings backup to fail while Photoshop is running, because the active workspace may not be flushed to disk yet.
+- Commit `abe4116` added an injected Registry updater so native tests cannot redirect the real `SettingsFilePath` to a deleted temp fixture.
+- Commit `1a2fa98` reproduced same-version CS6 workspace corruption: aliases made `WorkSpaces\Untitled-1` and `WorkSpaces (Modified)\Untitled-1` overwrite each other.
+- Commits `4d8bf6e`, `3e1665e`, and `f67029e` covered `WM_QUIT` preservation, documented `ReplaceFileW` partial-failure states 1176/1177, and the late cancellation/commit race.
 
 ## GREEN implementation
 
@@ -30,6 +35,11 @@
 - Commit `2938a5c` moved archive creation/restoration, compression, file I/O, font registration, Registry work, and the font-change broadcast to a joinable worker. Progress/completion is marshalled back with `WM_APP` messages; controls and message boxes remain UI-thread-only.
 - Progress posts are throttled to approximately 75 ms. The popup remains responsive without re-entering the operation call stack, disables conflicting actions, and changes `Đóng` to `Hủy` while work is active.
 - Cancellation is cooperative: backup checks during discovery and between compression/write stages and deletes an incomplete `.afang`; restore checks before additional metadata, writes, aliases, registration and completion. Already completed restore writes are retained and reported rather than rolled back or falsely reported as success.
+- Commit `31301f3` stages the complete backup in a same-directory temporary file, flushes it, then replaces the destination. Cancellation or write/commit failure deletes only the temporary file and preserves an existing `.afang` byte-for-byte.
+- Commit `bd2ae1e` blocks settings backup while Photoshop is running and explains that closing Photoshop is required to flush the current workspace/layout.
+- Commit `9cc37f6` routes Registry updates through an injectable seam in tests; production still updates the selected installed Photoshop version.
+- Commit `fd2582a` limits workspace compatibility aliases to real cross-version restores, so same-version `WorkSpaces` and `WorkSpaces (Modified)` files retain their distinct bytes.
+- Commits `4077dea`, `ba43695`, and `a1e735b` preserve outer `WM_QUIT`, use a safety backup/rollback for `ReplaceFileW` 1176/1177, clear the temporary file attribute, and arbitrate `Hủy` versus the atomic commit point with a single-winner gate.
 - Windows path validation rejects traversal, empty/dot segments, control characters, trailing dot/space, and reserved device prefixes before the first period.
 
 ## Regression specification
@@ -42,9 +52,15 @@
 | A blocked Pts worker does not block UI heartbeat/progress/completion dispatch | `TestPtsBackgroundTaskKeepsUiThreadResponsive` | PASS |
 | A cancellation request reaches the worker and completion reports cancelled, not success | `TestPtsBackgroundTaskCanBeCancelled` | PASS |
 | Multiple installed Photoshop versions are discovered and one selected version is archived | `TestSettingsBackupArchive` | PASS |
-| Cancelled backup leaves no incomplete `.afang` | `TestCancelledBackupDeletesIncompleteArchive` | PASS |
+| Saved `WorkSpaces (Modified)` data is included, and settings backup is refused while Photoshop is running | `TestSettingsBackupArchive`, `TestSettingsBackupRequiresPhotoshopToBeClosed` | PASS |
+| Cancelled backup leaves no incomplete `.afang` and preserves an existing archive when overwriting | `TestCancelledBackupDeletesIncompleteArchive` | PASS |
 | Cancelled restore stops before the next file and preserves a completed prior file | `TestCancelledRestoreStopsBeforeNextFile` | PASS |
 | Modern settings map to CS6 aliases/workspace layout | `TestCrossVersionMappingAndCs6Aliases`, `TestCrossVersionArchiveRestore` | PASS |
+| Same-version workspace variants keep their own bytes instead of overwriting through aliases | `TestSameVersionWorkspaceRestoreKeepsDistinctVariants` | PASS |
+| Native restore tests request but do not write the real Photoshop Registry path | injected updater in `TestCrossVersionArchiveRestore` | PASS |
+| `WM_QUIT` destroys the Pts dialog and is reposted to the outer app loop | `TestPtsDialogLoopPreservesQuitAndDestroysWindow` | PASS |
+| Replace failures 1176/1177 restore the old destination; committed files lose the temporary attribute | `TestAtomicCommitPreservesDestinationAcrossReplaceFailures` | PASS |
+| Cancellation and atomic backup commit have exactly one winner | `TestPtsCancellationCommitGateHasSingleWinner`, `TestCancelledBackupDeletesIncompleteArchive` | PASS |
 | A second identical font restore reuses `-restored-1` and preserves unrelated Registry mappings | `TestIdenticalFontRestoreIsSkipped` | PASS |
 | Malformed archives perform no writes | `TestMalformedArchiveDoesNotWriteAnything` | PASS |
 | Failed destination replacement preserves original bytes | `TestAtomicRestoreWritePreservesLockedDestination` | PASS |
