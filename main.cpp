@@ -34,6 +34,54 @@
 class ToolTypeApp;
 static ToolTypeApp* g_app = nullptr;
 
+// Pts popup progress presentation. Declared at file scope because
+// ToolTypeApp::PtsDialogState (outside the anonymous namespace) stores it.
+enum class PtsProgressDisplay { Idle, Marquee, Determinate, Done };
+
+constexpr UINT_PTR kPtsProgressTimerId = 1305;
+constexpr UINT kPtsProgressTimerIntervalMs = 30;
+constexpr COLORREF kPtsProgressTrackColor = RGB(22, 22, 22);
+constexpr COLORREF kPtsProgressFillColor = RGB(0, 135, 95);
+
+int AdvancePtsShownPercent(int reportedPercent, int shownPercent) {
+    return std::max(std::clamp(shownPercent, 0, 100), std::clamp(reportedPercent, 0, 100));
+}
+
+std::wstring PtsPercentLabelText(PtsProgressDisplay display, int shownPercent) {
+    if (display == PtsProgressDisplay::Done) return L"100%";
+    if (display == PtsProgressDisplay::Determinate) {
+        return std::to_wstring(std::clamp(shownPercent, 0, 100)) + L"%";
+    }
+    return L"";
+}
+
+// Declared at file scope because ToolTypeApp dialog states (outside the
+// anonymous namespace) store them by value/pointer.
+enum class PtsEntryKind : uint8_t {
+    PhotoshopSetting = 1,
+    Font = 2,
+};
+
+struct PtsBackupItem {
+    PtsEntryKind kind = PtsEntryKind::PhotoshopSetting;
+    std::wstring sourcePath;
+    std::wstring rootToken;
+    std::wstring relativePath;
+    std::wstring displayName;
+    uint64_t size = 0;
+};
+
+constexpr UINT_PTR kPtsFontSearchTimerId = 1311;
+constexpr UINT kPtsFontSearchDebounceMs = 180;
+
+// Hover must vanish the moment a click happens (capture held) or the cursor
+// is no longer over the button, so the pressed style never carries a stale
+// hover highlight after the click.
+bool ButtonHoverEffectActive(bool hotLight, bool disabled, bool captureActive,
+                             bool cursorInside) {
+    return hotLight && !disabled && !captureActive && cursorInside;
+}
+
 namespace {
 
 constexpr int kWindowWidth = 312;
@@ -90,6 +138,10 @@ constexpr int ID_PTS_BACKUP_SETTINGS = 1301;
 constexpr int ID_PTS_BACKUP_FONTS = 1302;
 constexpr int ID_PTS_BACKUP_ALL = 1303;
 constexpr int ID_PTS_RESTORE = 1304;
+constexpr int ID_PTS_FONT_SELECT_ALL = 1306;
+constexpr int ID_PTS_FONT_SELECT_NONE = 1307;
+constexpr int ID_PTS_FONT_SEARCH_EDIT = 1312;
+constexpr int ID_PTS_FONT_DELETE = 1313;
 constexpr int IDI_TOOLTYPE = 101;
 
 struct UpdateCheckResult {
@@ -695,20 +747,6 @@ void WriteUtf8File(const std::wstring& path, const std::string& data) {
     CloseHandle(file);
 }
 
-enum class PtsEntryKind : uint8_t {
-    PhotoshopSetting = 1,
-    Font = 2,
-};
-
-struct PtsBackupItem {
-    PtsEntryKind kind = PtsEntryKind::PhotoshopSetting;
-    std::wstring sourcePath;
-    std::wstring rootToken;
-    std::wstring relativePath;
-    std::wstring displayName;
-    uint64_t size = 0;
-};
-
 struct PtsPhotoshopRoot {
     std::wstring rootToken;
     std::wstring baseRoot;
@@ -727,6 +765,8 @@ struct PtsBackupOptions {
     std::set<std::wstring> selectedPhotoshopVersionKeys;
     std::set<std::wstring> selectedPhotoshopVersionLabels;
     std::wstring selectedPhotoshopVersionLabel;
+    std::vector<PtsBackupItem> presetFontItems;
+    bool usePresetFontItems = false;
 };
 
 struct PtsArchiveVersion {
@@ -1796,6 +1836,114 @@ bool GatherFontsFromRegistry(HKEY hive, bool userScope, std::vector<PtsBackupIte
     return true;
 }
 
+bool FindFontRegistryValue(HKEY hive, bool userScope, const std::wstring& fontPath,
+                           std::wstring& valueName) {
+    valueName.clear();
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(hive, L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Fonts",
+                      0, KEY_READ, &key) != ERROR_SUCCESS) {
+        return false;
+    }
+    const std::wstring target = LowerWide(fontPath);
+    bool found = false;
+    for (DWORD index = 0;; ++index) {
+        wchar_t name[512] = {};
+        DWORD nameLen = static_cast<DWORD>(std::size(name));
+        wchar_t data[2048] = {};
+        DWORD dataSize = sizeof(data);
+        DWORD type = 0;
+        LONG rc = RegEnumValueW(key, index, name, &nameLen, nullptr, &type,
+                                reinterpret_cast<LPBYTE>(data), &dataSize);
+        if (rc == ERROR_NO_MORE_ITEMS) break;
+        if (rc != ERROR_SUCCESS) continue;
+        if (type != REG_SZ && type != REG_EXPAND_SZ) continue;
+        std::wstring raw(data, data + (dataSize / sizeof(wchar_t)));
+        if (!raw.empty() && raw.back() == L'\0') raw.pop_back();
+        if (LowerWide(ResolveFontRegistryPath(raw, userScope)) == target) {
+            valueName.assign(name, nameLen);
+            found = true;
+            break;
+        }
+    }
+    RegCloseKey(key);
+    return found;
+}
+
+void BroadcastPtsFontChange() {
+    DWORD unused = 0;
+    SendMessageTimeoutW(HWND_BROADCAST, WM_FONTCHANGE, 0, 0, SMTO_ABORTIFHUNG, 1000,
+                        &unused);
+}
+
+struct PtsFontRemovalResult {
+    bool uninstalled = false;      // registry entry removed (or never present)
+    bool fileDeleted = false;
+    bool filePendingReboot = false;  // registry gone, but Windows still holds the file
+    std::wstring error;
+};
+
+PtsFontRemovalResult RemoveInstalledFont(const std::wstring& fontPath) {
+    PtsFontRemovalResult result{};
+    const wchar_t* fontsKeyPath =
+        L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Fonts";
+    // Tell GDI to drop the font first so the file is no longer locked
+    // (deleting a still-registered font fails with access denied, code 5).
+    RemoveFontResourceW(fontPath.c_str());
+
+    std::wstring valueName;
+    if (FindFontRegistryValue(HKEY_CURRENT_USER, true, fontPath, valueName)) {
+        HKEY key = nullptr;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, fontsKeyPath, 0, KEY_SET_VALUE,
+                          &key) == ERROR_SUCCESS) {
+            LONG rc = RegDeleteValueW(key, valueName.c_str());
+            RegCloseKey(key);
+            if (rc != ERROR_SUCCESS && rc != ERROR_FILE_NOT_FOUND) {
+                result.error = L"Không gỡ được đăng ký font người dùng (mã " +
+                               std::to_wstring(rc) + L").";
+            }
+        }
+    }
+    if (result.error.empty() &&
+        FindFontRegistryValue(HKEY_LOCAL_MACHINE, false, fontPath, valueName)) {
+        HKEY key = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, fontsKeyPath, 0, KEY_SET_VALUE,
+                          &key) == ERROR_SUCCESS) {
+            LONG rc = RegDeleteValueW(key, valueName.c_str());
+            RegCloseKey(key);
+            if (rc != ERROR_SUCCESS && rc != ERROR_FILE_NOT_FOUND) {
+                result.error = L"Không gỡ được đăng ký font toàn máy (cần quyền quản trị).";
+            }
+        } else {
+            result.error = L"Không gỡ được đăng ký font toàn máy (cần quyền quản trị).";
+        }
+    }
+
+    result.uninstalled = result.error.empty();
+    if (result.uninstalled) {
+        if (DeleteFileW(fontPath.c_str())) {
+            result.fileDeleted = true;
+        } else {
+            DWORD rc = GetLastError();
+            if (rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND) {
+                result.fileDeleted = true;
+            } else {
+                // Registry is already clean, so the font is uninstalled; the
+                // file itself stays until reboot.
+                result.filePendingReboot = true;
+            }
+        }
+    }
+    return result;
+}
+
+// Kept for tests; the live dialog uses RemoveInstalledFont directly.
+[[maybe_unused]] bool DeleteInstalledFontFile(const std::wstring& fontPath,
+                                              std::wstring& error) {
+    PtsFontRemovalResult result = RemoveInstalledFont(fontPath);
+    error = result.error;
+    return result.uninstalled && result.fileDeleted && !result.filePendingReboot;
+}
+
 bool GatherFontItems(std::vector<PtsBackupItem>& items,
                      const PtsProgressCallback& progress = {},
                      const PtsCancellationCallback& cancelled = {}) {
@@ -1833,6 +1981,17 @@ bool GatherFontItems(std::vector<PtsBackupItem>& items,
         }
     }
     return !(cancelled && cancelled());
+}
+
+void SortPtsFontItemsForSelection(std::vector<PtsBackupItem>& items) {
+    std::stable_sort(items.begin(), items.end(),
+                     [](const PtsBackupItem& a, const PtsBackupItem& b) {
+                         std::wstring nameA = LowerWide(a.displayName);
+                         std::wstring nameB = LowerWide(b.displayName);
+                         if (nameA != nameB) return nameA < nameB;
+                         return LowerWide(FileNameOnly(a.sourcePath)) <
+                                LowerWide(FileNameOnly(b.sourcePath));
+                     });
 }
 
 bool WriteAll(HANDLE file, const void* data, DWORD bytes) {
@@ -2108,8 +2267,9 @@ std::wstring CollapsePtsWhitespace(const std::wstring& text) {
     return out;
 }
 
+constexpr size_t kPtsNoticeLineLimit = 56;
+
 bool AddCompactPtsNoticeLine(std::vector<std::wstring>& lines, const std::wstring& rawLine) {
-    constexpr size_t kPtsNoticeLineLimit = 40;
     std::wstring remaining = CollapsePtsWhitespace(rawLine);
     while (!remaining.empty() && lines.size() < 2) {
         if (remaining.size() <= kPtsNoticeLineLimit) {
@@ -2130,7 +2290,6 @@ bool AddCompactPtsNoticeLine(std::vector<std::wstring>& lines, const std::wstrin
 }
 
 void MarkCompactPtsNoticeAsTruncated(std::wstring& line) {
-    constexpr size_t kPtsNoticeLineLimit = 40;
     if (line.size() >= 3 && line.compare(line.size() - 3, 3, L"...") == 0) return;
     if (line.size() + 3 <= kPtsNoticeLineLimit) {
         line += L"...";
@@ -2211,6 +2370,43 @@ DWORD PtsDialogExtendedStyle(bool topMost) {
     return WS_EX_TOOLWINDOW | (topMost ? WS_EX_TOPMOST : 0);
 }
 
+struct PtsFontPickLayout {
+    int clientWidth = 0;
+    int clientHeight = 0;
+    RECT title{};
+    RECT prompt{};
+    RECT search{};
+    RECT list{};
+    RECT summary{};
+    RECT selectAll{};
+    RECT selectNone{};
+    RECT deleteButton{};
+    RECT ok{};
+    RECT cancel{};
+};
+
+PtsFontPickLayout CalculateFontPickDialogLayout(UINT dpi) {
+    auto scaledRect = [dpi](LONG left, LONG top, LONG right, LONG bottom) {
+        return RECT{ScalePtsMetric(left, dpi), ScalePtsMetric(top, dpi),
+                    ScalePtsMetric(right, dpi), ScalePtsMetric(bottom, dpi)};
+    };
+
+    PtsFontPickLayout layout{};
+    layout.clientWidth = ScalePtsMetric(640, dpi);
+    layout.clientHeight = ScalePtsMetric(482, dpi);
+    layout.title = scaledRect(18, 14, 622, 38);
+    layout.prompt = scaledRect(18, 44, 622, 66);
+    layout.search = scaledRect(18, 74, 622, 102);
+    layout.list = scaledRect(18, 110, 622, 398);
+    layout.summary = scaledRect(18, 404, 622, 426);
+    layout.selectAll = scaledRect(18, 436, 150, 468);
+    layout.selectNone = scaledRect(162, 436, 290, 468);
+    layout.deleteButton = scaledRect(302, 436, 430, 468);
+    layout.cancel = scaledRect(442, 436, 522, 468);
+    layout.ok = scaledRect(534, 436, 622, 468);
+    return layout;
+}
+
 UINT QueryPtsDialogDpi(HWND owner) {
     HDC dc = GetDC(owner);
     if (!dc) return 96;
@@ -2243,6 +2439,186 @@ std::wstring FormatBytes(uint64_t bytes) {
     return text;
 }
 
+std::wstring FormatPtsFontSelectionSummary(size_t selectedCount, size_t totalCount,
+                                           uint64_t selectedBytes) {
+    return L"Đã chọn " + std::to_wstring(selectedCount) + L"/" +
+           std::to_wstring(totalCount) + L" font — " + FormatBytes(selectedBytes);
+}
+
+std::wstring FormatPtsFontDeleteButtonText(size_t selectedCount) {
+    return L"Xóa (" + std::to_wstring(selectedCount) + L")";
+}
+
+std::wstring FormatPtsFontDeleteSummary(uint32_t deletedCount, uint32_t failedCount) {
+    std::wstring summary = L"Đã xóa " + std::to_wstring(deletedCount) + L" font";
+    if (failedCount > 0) {
+        summary += L", " + std::to_wstring(failedCount) + L" font không xóa được";
+    }
+    return summary + L".";
+}
+
+wchar_t FoldAccentCharForSearch(wchar_t ch) {
+    if (ch == L'đ' || ch == L'Đ') return L'd';
+    wchar_t decomposed[4] = {};
+    int parts = FoldStringW(MAP_COMPOSITE, &ch, 1, decomposed, 4);
+    for (int i = 0; i < parts; ++i) {
+        wchar_t part = decomposed[i];
+        if (part >= 0x0300 && part <= 0x036F) continue;
+        if (part >= L'A' && part <= L'Z') return part - L'A' + L'a';
+        return part;
+    }
+    if (ch >= L'A' && ch <= L'Z') return ch - L'A' + L'a';
+    return ch;
+}
+
+std::wstring FoldPtsFontSearchKey(const std::wstring& text) {
+    // Whitespace runs collapse to a single space, but boundary spaces are
+    // preserved: the query "SJ " must require a space after "SJ".
+    std::wstring out;
+    out.reserve(text.size());
+    bool pendingSpace = false;
+    for (wchar_t ch : text) {
+        if (iswspace(ch)) {
+            pendingSpace = true;
+            continue;
+        }
+        if (pendingSpace) {
+            out.push_back(L' ');
+            pendingSpace = false;
+        }
+        out.push_back(FoldAccentCharForSearch(ch));
+    }
+    if (pendingSpace) out.push_back(L' ');
+    return out;
+}
+
+bool IsFontWordSeparator(wchar_t ch) {
+    return ch == L' ' || ch == L'-' || ch == L'_' || ch == L'.';
+}
+
+bool FontFoldedTextHasToken(const std::wstring& foldedText, const std::wstring& token,
+                            bool requireWordEnd) {
+    size_t pos = 0;
+    while ((pos = foldedText.find(token, pos)) != std::wstring::npos) {
+        const bool startOk =
+            pos == 0 || IsFontWordSeparator(foldedText[pos - 1]);
+        const size_t after = pos + token.size();
+        const bool endOk =
+            !requireWordEnd || after == foldedText.size() ||
+            IsFontWordSeparator(foldedText[after]);
+        if (startOk && endOk) return true;
+        ++pos;
+    }
+    return false;
+}
+
+struct PtsFontQuery {
+    std::vector<std::wstring> tokens;
+    // A token must end at a word boundary when the user pressed space right
+    // after it: "sj " requires the standalone word "sj", not "sjabc".
+    std::vector<bool> tokenRequiresWordEnd;
+};
+
+PtsFontQuery ParsePtsFontQuery(const std::wstring& rawQuery) {
+    const std::wstring folded = FoldPtsFontSearchKey(rawQuery);
+    PtsFontQuery query{};
+    std::wstring current;
+    for (wchar_t ch : folded) {
+        if (ch == L' ') {
+            if (!current.empty()) {
+                query.tokens.push_back(current);
+                query.tokenRequiresWordEnd.push_back(true);
+                current.clear();
+            }
+        } else {
+            current.push_back(ch);
+        }
+    }
+    if (!current.empty()) {
+        query.tokens.push_back(current);
+        // No trailing space: the last token may end mid-word ("sj" matches
+        // "SJabc" as a prefix).
+        query.tokenRequiresWordEnd.push_back(false);
+    } else if (!folded.empty() && folded.back() == L' ' && !query.tokens.empty()) {
+        query.tokenRequiresWordEnd.back() = true;
+    }
+    return query;
+}
+
+bool PtsFontMatchesQueryFolded(const PtsFontQuery& query, const std::wstring& foldedName,
+                               const std::wstring& foldedFile) {
+    for (size_t i = 0; i < query.tokens.size(); ++i) {
+        const bool requireWordEnd = i < query.tokenRequiresWordEnd.size() &&
+                                    query.tokenRequiresWordEnd[i];
+        if (!FontFoldedTextHasToken(foldedName, query.tokens[i], requireWordEnd) &&
+            !FontFoldedTextHasToken(foldedFile, query.tokens[i], requireWordEnd)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Raw-string contract kept for tests; the live dialog uses the folded cache.
+[[maybe_unused]] bool PtsFontMatchesQuery(const std::wstring& rawQuery,
+                                          const std::wstring& displayName,
+                                          const std::wstring& fileName) {
+    PtsFontQuery query = ParsePtsFontQuery(rawQuery);
+    if (query.tokens.empty()) return true;
+    return PtsFontMatchesQueryFolded(query, FoldPtsFontSearchKey(displayName),
+                                     FoldPtsFontSearchKey(fileName));
+}
+
+bool CursorIsOverWindow(HWND window) {
+    if (!window) return false;
+    POINT pt{};
+    GetCursorPos(&pt);
+    RECT rc{};
+    if (!GetWindowRect(window, &rc)) return false;
+    POINT local{pt};
+    return PtInRect(&rc, local) != 0;
+}
+std::wstring FormatPtsBackupSummary(size_t settingsCount, uint64_t settingsBytes,
+                                    size_t fontCount, uint64_t fontBytes,
+                                    const std::wstring& versionLabel,
+                                    uint32_t skippedFiles) {
+    std::wstring summary = L"Đã sao lưu";
+    if (settingsCount > 0) summary += L", " + FormatBytes(settingsBytes);
+    if (fontCount > 0) {
+        summary += settingsCount > 0 ? L", " : L" ";
+        summary += std::to_wstring(fontCount) + L" font, " + FormatBytes(fontBytes);
+    }
+    if (!versionLabel.empty()) summary += L", " + versionLabel;
+    summary += L".";
+    if (skippedFiles > 0) {
+        summary += L" Bỏ qua " + std::to_wstring(skippedFiles) + L" file.";
+    }
+    return summary;
+}
+
+std::wstring FormatPtsRestoreSummary(uint32_t settingsCount, uint32_t fontCount,
+                                     const std::wstring& versionDetail,
+                                     uint32_t skippedExistingFonts,
+                                     uint32_t skippedByVersion) {
+    std::wstring summary = L"Đã khôi phục";
+    if (settingsCount > 0) {
+        summary += L" " + std::to_wstring(settingsCount) + L" file cài đặt";
+    }
+    if (fontCount > 0) {
+        summary += settingsCount > 0 ? L", " : L" ";
+        summary += std::to_wstring(fontCount) + L" font";
+    }
+    if (!versionDetail.empty()) summary += L", " + versionDetail;
+    summary += L".";
+    if (skippedExistingFonts > 0) {
+        summary += L" Bỏ qua " + std::to_wstring(skippedExistingFonts) + L" font đã có.";
+    }
+    if (skippedByVersion > 0) {
+        summary += L" Bỏ qua " + std::to_wstring(skippedByVersion) +
+                   L" mục khác phiên bản.";
+    }
+    return summary;
+}
+
 bool CreatePtsBackupArchive(const std::wstring& path, bool includeSettings, bool includeFonts,
                              const PtsBackupOptions& options,
                              const PtsProgressCallback& progress, std::wstring& summary,
@@ -2267,15 +2643,18 @@ bool CreatePtsBackupArchive(const std::wstring& path, bool includeSettings, bool
             return false;
         }
     }
-    size_t settingsCount = items.size();
     if (includeFonts) {
-        progress(includeSettings ? 14 : 8, L"Đang tìm font tùy chỉnh...");
-        if (!GatherFontItems(items, progress, cancelled)) {
-            error = L"Đã hủy sao lưu Pts.";
-            return false;
+        if (options.usePresetFontItems) {
+            items.insert(items.end(), options.presetFontItems.begin(),
+                         options.presetFontItems.end());
+        } else {
+            progress(includeSettings ? 14 : 8, L"Đang tìm font tùy chỉnh...");
+            if (!GatherFontItems(items, progress, cancelled)) {
+                error = L"Đã hủy sao lưu Pts.";
+                return false;
+            }
         }
     }
-    size_t fontCount = items.size() - settingsCount;
     if (items.empty()) {
         error = L"Không tìm thấy cài đặt Photoshop hoặc font tùy chỉnh để sao lưu.";
         return false;
@@ -2299,8 +2678,10 @@ bool CreatePtsBackupArchive(const std::wstring& path, bool includeSettings, bool
               WriteU32File(file, 0);
     uint32_t writtenEntries = 0;
     uint32_t skipped = 0;
-    uint64_t sourceBytes = 0;
-    uint64_t archiveBytes = 0;
+    uint32_t writtenSettings = 0;
+    uint32_t writtenFonts = 0;
+    uint64_t settingsSourceBytes = 0;
+    uint64_t fontSourceBytes = 0;
     bool cancellationObserved = false;
 
     for (size_t i = 0; ok && i < items.size(); ++i) {
@@ -2327,10 +2708,11 @@ bool CreatePtsBackupArchive(const std::wstring& path, bool includeSettings, bool
             cancellationObserved = true;
             break;
         }
-        sourceBytes += static_cast<uint64_t>(raw.size());
-        archiveBytes += static_cast<uint64_t>(stored.size());
-
-        ok = WriteU8(file, static_cast<uint8_t>(item.kind)) &&
+        if (item.kind == PtsEntryKind::Font) {
+            fontSourceBytes += static_cast<uint64_t>(raw.size());
+        } else {
+            settingsSourceBytes += static_cast<uint64_t>(raw.size());
+        }        ok = WriteU8(file, static_cast<uint8_t>(item.kind)) &&
              WriteUtf8String(file, item.rootToken) &&
              WriteUtf8String(file, item.relativePath) &&
              WriteUtf8String(file, item.displayName) &&
@@ -2340,6 +2722,11 @@ bool CreatePtsBackupArchive(const std::wstring& path, bool includeSettings, bool
              (stored.empty() || WriteAll(file, stored.data(), static_cast<DWORD>(stored.size())));
         if (ok) {
             ++writtenEntries;
+            if (item.kind == PtsEntryKind::Font) {
+                ++writtenFonts;
+            } else {
+                ++writtenSettings;
+            }
         }
     }
 
@@ -2387,18 +2774,10 @@ bool CreatePtsBackupArchive(const std::wstring& path, bool includeSettings, bool
     }
 
     progress(100, L"Đã tạo xong file sao lưu .afang.");
-    summary = L"Đã sao lưu " + std::to_wstring(writtenEntries) + L" file (" +
-              FormatBytes(sourceBytes) + L" → " + FormatBytes(archiveBytes) + L").";
-    if (settingsCount > 0 || fontCount > 0) {
-        summary += L" Cài đặt: " + std::to_wstring(settingsCount) +
-                   L", font tùy chỉnh: " + std::to_wstring(fontCount) + L".";
-    }
-    if (includeSettings && !options.selectedPhotoshopVersionLabel.empty()) {
-        summary += L" Phiên bản Photoshop: " + options.selectedPhotoshopVersionLabel + L".";
-    }
-    if (skipped > 0) {
-        summary += L" Bỏ qua " + std::to_wstring(skipped) + L" file không đọc được.";
-    }
+    summary = FormatPtsBackupSummary(
+        writtenSettings, settingsSourceBytes, writtenFonts, fontSourceBytes,
+        includeSettings ? options.selectedPhotoshopVersionLabel : std::wstring(),
+        skipped);
     return true;
 }
 
@@ -4275,10 +4654,7 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
     uint32_t fontsAlreadyPresent = 0;
     uint32_t settingsRestored = 0;
     uint32_t skippedByVersion = 0;
-    uint32_t settingsCompatibilityAliases = 0;
-    uint32_t workspaceCompatibilityConversions = 0;
     uint32_t registrySettingsPathUpdates = 0;
-    uint64_t restoredBytes = 0;
     bool appliedAnyChange = false;
     std::set<std::wstring> restoredSettingsRoots;
     std::set<std::wstring> targetSettingsFoldersForRegistry;
@@ -4402,7 +4778,6 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
                 }
                 appliedAnyChange = true;
                 ++fontFilesWritten;
-                restoredBytes += raw.size();
             }
             fontsToRegister.push_back({destination, displayName});
             ++fontRestored;
@@ -4458,7 +4833,6 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
         const bool crossVersionRestore =
             ShouldRewritePhotoshopVersionLabel(sourceLabel,
                                                options.targetVersionLabel);
-        bool convertedWorkspaceForEntry = false;
         for (size_t pathIndex = 0; pathIndex < destinationRelativePaths.size(); ++pathIndex) {
             const auto& targetRelativePath = destinationRelativePaths[pathIndex];
             if (pathIndex > 0 &&
@@ -4495,7 +4869,6 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
                         raw, options.targetVersionLabel, targetPath, normalized);
                 if (compatibility == WorkspaceCompatibilityResult::Converted) {
                     bytesToWrite.swap(normalized);
-                    convertedWorkspaceForEntry = true;
                 } else if (compatibility == WorkspaceCompatibilityResult::Incompatible) {
                     CloseHandle(file);
                     error = L"Workspace không tương thích với Photoshop đích.\n" +
@@ -4508,7 +4881,6 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
                 return false;
             }
             appliedAnyChange = true;
-            if (pathIndex > 0) ++settingsCompatibilityAliases;
 
             if (options.HasTargetMapping() && rootToken == L"APPDATA") {
                 std::wstring settingsFolderRelativePath;
@@ -4520,7 +4892,6 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
             }
         }
 
-        if (convertedWorkspaceForEntry) ++workspaceCompatibilityConversions;
         std::wstring restoredRoot;
         std::wstring restoredLabel;
         if (ExtractPhotoshopVersionInfo(destinationRelativePath, restoredRoot, restoredLabel)) {
@@ -4528,7 +4899,6 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
         }
         ++settingsRestored;
         ++restored;
-        restoredBytes += raw.size();
     }
 
     CloseHandle(file);
@@ -4588,43 +4958,29 @@ bool RestorePtsBackupArchive(const std::wstring& path, const PtsRestoreOptions& 
     }
 
     progress(100, L"Đã khôi phục xong dữ liệu .afang.");
-    summary = L"Đã khôi phục " + std::to_wstring(restored) + L" file (" +
-              FormatBytes(restoredBytes) + L").";
-    if (settingsRestored > 0 || fontRestored > 0) {
-        summary += L" Cài đặt: " + std::to_wstring(settingsRestored) +
-                   L", font: " + std::to_wstring(fontRestored) + L".";
+    std::wstring versionDetail;
+    if (!options.sourceVersionLabel.empty() && !options.targetVersionLabel.empty() &&
+        LowerWide(options.sourceVersionLabel) != LowerWide(options.targetVersionLabel)) {
+        versionDetail =
+            options.sourceVersionLabel + L" → " + options.targetVersionLabel;
+    } else if (!options.targetVersionLabel.empty()) {
+        versionDetail = options.targetVersionLabel;
+    } else if (!options.sourceVersionLabel.empty()) {
+        versionDetail = options.sourceVersionLabel;
     }
-    std::wstring detail;
-    if (!options.sourceVersionLabel.empty() && !options.targetVersionLabel.empty()) {
-        detail = options.sourceVersionLabel + L" → " + options.targetVersionLabel + L".";
-    }
-    if (workspaceCompatibilityConversions > 0) {
-        detail += L" Đã chuyển đổi " + std::to_wstring(workspaceCompatibilityConversions) +
-                  L" workspace.";
-    }
-    if (settingsCompatibilityAliases > 0) {
-        detail += L" Đã tạo " + std::to_wstring(settingsCompatibilityAliases) +
-                  L" đường dẫn tương thích.";
-    }
-    if (!targetSettingsFoldersForRegistry.empty()) {
-        detail += registrySettingsPathUpdates > 0
-                      ? L" Đã cập nhật SettingsFilePath."
-                      : L" Registry chưa có SettingsFilePath phù hợp.";
-    }
-    if (fontsAlreadyPresent > 0) {
-        detail += L" Bỏ qua " + std::to_wstring(fontsAlreadyPresent) + L" font đã có.";
-    }
+    summary = FormatPtsRestoreSummary(settingsRestored, fontRestored, versionDetail,
+                                      fontsAlreadyPresent, skippedByVersion);
+    std::wstring note;
     if (fontRestored > 0 && fontRegistration.resourceRegistrations == 0) {
-        detail += L" Font đã chép; Windows chưa nạp ngay.";
+        note += L" Font đã chép; Windows chưa nạp ngay.";
     }
     if (fontFilesWritten > 0 && fontRegistration.registryUpdates == 0) {
-        detail += L" Registry font chưa cập nhật.";
+        note += L" Registry font chưa cập nhật.";
     }
-    if (skippedByVersion > 0) {
-        detail += L" Bỏ qua " + std::to_wstring(skippedByVersion) +
-                  L" cài đặt khác phiên bản.";
+    if (!targetSettingsFoldersForRegistry.empty() && registrySettingsPathUpdates == 0) {
+        note += L" Registry chưa có SettingsFilePath phù hợp.";
     }
-    if (!detail.empty()) summary += L"\n" + detail;
+    if (!note.empty()) summary += L"\n" + TrimCopy(note);
     return true;
 }
 
@@ -4929,7 +5285,10 @@ private:
         HWND restore = nullptr;
         HWND close = nullptr;
         RECT progressRect{18, 220, 502, 240};
-        int progress = 0;
+        PtsProgressDisplay display = PtsProgressDisplay::Idle;
+        int shownProgress = 0;
+        int marqueeOffset = 0;
+        UINT dpi = 96;
         ULONGLONG lastProgressPaint = 0;
         std::wstring lastProgressMessage;
         bool busy = false;
@@ -4946,6 +5305,25 @@ private:
         std::vector<std::wstring> options;
         HWND list = nullptr;
         int selectedIndex = 0;
+        bool accepted = false;
+    };
+
+    struct FontPickDialogState {
+        ToolTypeApp* app = nullptr;
+        std::vector<PtsBackupItem>* items = nullptr;
+        std::vector<bool> selected;
+        std::vector<int> filtered;
+        std::vector<std::pair<std::wstring, std::wstring>> foldedCache;
+        bool deleting = false;
+        UINT dpi = 96;
+        HWND dialog = nullptr;
+        HWND list = nullptr;
+        HWND search = nullptr;
+        HWND summary = nullptr;
+        HWND ok = nullptr;
+        HWND deleteButton = nullptr;
+        WNDPROC originalListProc = nullptr;
+        WNDPROC originalSearchProc = nullptr;
         bool accepted = false;
     };
 
@@ -5120,6 +5498,15 @@ private:
                 delete result;
                 return 0;
             }
+            case WM_TIMER:
+                if (wp == kPtsProgressTimerId) {
+                    if (state && state->display == PtsProgressDisplay::Marquee) {
+                        state->marqueeOffset += ScalePtsMetric(6, state->dpi);
+                        InvalidateRect(hwnd, &state->progressRect, FALSE);
+                    }
+                    return 0;
+                }
+                break;
             case WM_KEYDOWN:
                 if (wp == VK_ESCAPE && state) {
                     if (state->busy && state->app) {
@@ -5138,6 +5525,7 @@ private:
                 DestroyWindow(hwnd);
                 return 0;
             case WM_DESTROY:
+                KillTimer(hwnd, kPtsProgressTimerId);
                 if (state && state->workerThread) {
                     RequestPtsCancellation(
                         std::static_pointer_cast<PtsCancellationState>(state->cancellation));
@@ -5238,6 +5626,179 @@ private:
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
 
+    static LRESULT CALLBACK FontPickSearchWndProc(HWND hwnd, UINT msg, WPARAM wp,
+                                                  LPARAM lp) {
+        auto* state =
+            reinterpret_cast<FontPickDialogState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (state && state->originalSearchProc) {
+            LRESULT result = CallWindowProcW(state->originalSearchProc, hwnd, msg, wp, lp);
+            // EM_SETCUEBANNER never rendered on this setup, so the placeholder
+            // is owner-drawn: gray text while the box is empty and unfocused.
+            if (msg == WM_PAINT && GetWindowTextLengthW(hwnd) == 0 &&
+                GetFocus() != hwnd) {
+                HDC dc = GetDC(hwnd);
+                if (dc) {
+                    HFONT font = reinterpret_cast<HFONT>(
+                        SendMessageW(hwnd, WM_GETFONT, 0, 0));
+                    HGDIOBJ oldFont =
+                        SelectObject(dc, font ? font : GetStockObject(SYSTEM_FONT));
+                    RECT rc{};
+                    GetClientRect(hwnd, &rc);
+                    InflateRect(&rc, -6, 0);
+                    SetBkMode(dc, TRANSPARENT);
+                    SetTextColor(dc, RGB(140, 150, 154));
+                    DrawTextW(dc, L"Tìm kiếm", -1, &rc,
+                              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                    SelectObject(dc, oldFont);
+                    ReleaseDC(hwnd, dc);
+                }
+            }
+            return result;
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+
+    static LRESULT CALLBACK FontPickListWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+        auto* state =
+            reinterpret_cast<FontPickDialogState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (state && state->app && msg == WM_LBUTTONDOWN) {
+            LRESULT hit = SendMessageW(hwnd, LB_ITEMFROMPOINT, 0, lp);
+            int index = LOWORD(hit);
+            if (HIWORD(hit) == 0 && index >= 0 &&
+                static_cast<size_t>(index) < state->filtered.size()) {
+                state->app->ToggleFontPickItem(state, index);
+                return 0;
+            }
+        }
+        if (state && state->originalListProc) {
+            return CallWindowProcW(state->originalListProc, hwnd, msg, wp, lp);
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+
+    static LRESULT CALLBACK FontPickDialogWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+        auto* state =
+            reinterpret_cast<FontPickDialogState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (msg == WM_NCCREATE) {
+            auto* cs = reinterpret_cast<CREATESTRUCTW*>(lp);
+            state = reinterpret_cast<FontPickDialogState*>(cs->lpCreateParams);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+        }
+
+        switch (msg) {
+            case WM_ERASEBKGND:
+                if (state && state->app) {
+                    state->app->FillDialogBackground(hwnd, reinterpret_cast<HDC>(wp));
+                    return 1;
+                }
+                break;
+            case WM_PAINT:
+                if (state && state->app) {
+                    state->app->PaintDialogFrame(hwnd);
+                    return 0;
+                }
+                break;
+            case WM_CTLCOLORSTATIC:
+                if (state && state->app) {
+                    SetTextColor(reinterpret_cast<HDC>(wp), kTextColor);
+                    SetBkMode(reinterpret_cast<HDC>(wp), TRANSPARENT);
+                    return reinterpret_cast<LRESULT>(state->app->backBrush_);
+                }
+                break;
+            case WM_CTLCOLORLISTBOX:
+                if (state && state->app) {
+                    SetTextColor(reinterpret_cast<HDC>(wp), kTextColor);
+                    SetBkColor(reinterpret_cast<HDC>(wp), kPanelColor);
+                    return reinterpret_cast<LRESULT>(state->app->panelBrush_);
+                }
+                break;
+            case WM_CTLCOLOREDIT:
+                if (state && state->app) {
+                    SetTextColor(reinterpret_cast<HDC>(wp), kTextColor);
+                    SetBkColor(reinterpret_cast<HDC>(wp), kPanelColor);
+                    return reinterpret_cast<LRESULT>(state->app->panelBrush_);
+                }
+                break;
+            case WM_MEASUREITEM:
+                if (state && wp == reinterpret_cast<WPARAM>(state->list)) {
+                    reinterpret_cast<MEASUREITEMSTRUCT*>(lp)->itemHeight =
+                        ScalePtsMetric(24, state->dpi);
+                    return TRUE;
+                }
+                break;
+            case WM_DRAWITEM:
+                if (state && state->app) {
+                    auto* di = reinterpret_cast<DRAWITEMSTRUCT*>(lp);
+                    if (di && di->CtlType == ODT_LISTBOX) {
+                        state->app->DrawFontPickListRow(state, di);
+                    } else {
+                        state->app->DrawDialogButton(di);
+                    }
+                    return TRUE;
+                }
+                break;
+            case WM_VKEYTOITEM:
+                if (state && state->app && state->list) {
+                    if (wp == VK_SPACE) {
+                        int caret = HIWORD(lp);
+                        if (caret >= 0 &&
+                            static_cast<size_t>(caret) < state->filtered.size()) {
+                            state->app->ToggleFontPickItem(state, caret);
+                            return -2;
+                        }
+                    }
+                }
+                return -1;
+            case WM_TIMER:
+                if (wp == kPtsFontSearchTimerId) {
+                    KillTimer(hwnd, kPtsFontSearchTimerId);
+                    if (state && state->app) state->app->ApplyFontPickSearch(state);
+                    return 0;
+                }
+                break;
+            case WM_COMMAND:
+                if (!state || !state->app) break;
+                if (HIWORD(wp) == EN_CHANGE && LOWORD(wp) == ID_PTS_FONT_SEARCH_EDIT) {
+                    SetTimer(hwnd, kPtsFontSearchTimerId, kPtsFontSearchDebounceMs,
+                             nullptr);
+                    if (state->search) InvalidateRect(state->search, nullptr, TRUE);
+                    return 0;
+                }
+                if ((HIWORD(wp) == EN_SETFOCUS || HIWORD(wp) == EN_KILLFOCUS) &&
+                    LOWORD(wp) == ID_PTS_FONT_SEARCH_EDIT) {
+                    if (state->search) InvalidateRect(state->search, nullptr, TRUE);
+                    return 0;
+                }
+                switch (LOWORD(wp)) {
+                    case ID_PTS_FONT_SELECT_ALL:
+                        state->app->ApplyFontPickFilterSelect(state, true);
+                        return 0;
+                    case ID_PTS_FONT_SELECT_NONE:
+                        state->app->ApplyFontPickFilterSelect(state, false);
+                        return 0;
+                    case ID_PTS_FONT_DELETE:
+                        state->app->OnFontPickDeleteRequested(state);
+                        return 0;
+                    case IDOK:
+                        state->accepted = true;
+                        DestroyWindow(hwnd);
+                        return 0;
+                    case IDCANCEL:
+                        DestroyWindow(hwnd);
+                        return 0;
+                }
+                break;
+            case WM_CLOSE:
+                DestroyWindow(hwnd);
+                return 0;
+            case WM_DESTROY:
+                KillTimer(hwnd, kPtsFontSearchTimerId);
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                break;
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+
     static LRESULT CALLBACK ButtonWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         auto* app = reinterpret_cast<ToolTypeApp*>(GetWindowLongPtrW(GetParent(hwnd), GWLP_USERDATA));
         if (app) {
@@ -5248,6 +5809,15 @@ private:
                 TrackMouseEvent(&tme);
             } else if (msg == WM_MOUSELEAVE) {
                 if (app->hoverButtonId_ == id) app->SetHoveredButton(0);
+            } else if (msg == WM_LBUTTONUP) {
+                // The click may have opened a modal popup that swallowed
+                // WM_MOUSELEAVE; drop the hover highlight so it never sticks.
+                LRESULT result = CallWindowProcW(app->buttonProc_, hwnd, msg, wp, lp);
+                if (app->hoverButtonId_ == id) app->SetHoveredButton(0);
+                TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0};
+                TrackMouseEvent(&tme);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return result;
             }
             return CallWindowProcW(app->buttonProc_, hwnd, msg, wp, lp);
         }
@@ -5432,7 +6002,9 @@ private:
         bool pressed = (di->itemState & ODS_SELECTED) != 0;
         bool disabled = (di->itemState & ODS_DISABLED) != 0;
         int id = GetDlgCtrlID(di->hwndItem);
-        bool hot = hoverButtonId_ == id || (di->itemState & ODS_HOTLIGHT) != 0;
+        bool hot = ButtonHoverEffectActive(
+            hoverButtonId_ == id || (di->itemState & ODS_HOTLIGHT) != 0, disabled,
+            GetCapture() != nullptr, CursorIsOverWindow(di->hwndItem));
         RECT rc = di->rcItem;
         COLORREF fill = kButtonColor;
         COLORREF border = kBorderColor;
@@ -5472,8 +6044,10 @@ private:
         RECT textRc = rc;
         if (pressed) OffsetRect(&textRc, 1, 1);
         InflateRect(&textRc, id == ID_HOTKEY ? -2 : 0, 0);
+        InflateRect(&textRc, -2, 0);
         DrawTextW(di->hDC, text, -1, &textRc,
-                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX |
+                      DT_END_ELLIPSIS);
     }
 
     void FillDialogBackground(HWND hwnd, HDC hdc) {
@@ -5516,13 +6090,38 @@ private:
         DeleteObject(pen);
 
         RECT bar = state ? state->progressRect : RECT{18, 220, 502, 240};
-        FillSolidRect(hdc, bar, RGB(22, 22, 22));
+        const PtsProgressDisplay display =
+            state ? state->display : PtsProgressDisplay::Idle;
+        const int shownPercent =
+            state ? std::clamp(state->shownProgress, 0, 100) : 0;
+        FillSolidRect(hdc, bar, kPtsProgressTrackColor);
         DrawCrispOnePixelBorder(hdc, bar, kBorderColor);
-        int pct = state ? std::clamp(state->progress, 0, 100) : 0;
+        const int trackWidth = std::max(0, RectWidth(bar) - 2);
         RECT fill = bar;
-        fill.right = fill.left + MulDiv(RectWidth(bar), pct, 100);
-        if (fill.right > fill.left) {
-            FillSolidRect(hdc, fill, RGB(0, 135, 95));
+        ++fill.left;
+        --fill.right;
+        ++fill.top;
+        --fill.bottom;
+        if (display == PtsProgressDisplay::Determinate ||
+            display == PtsProgressDisplay::Done) {
+            fill.right = fill.left + MulDiv(trackWidth, shownPercent, 100);
+            if (fill.right > fill.left) {
+                FillSolidRect(hdc, fill, kPtsProgressFillColor);
+            }
+        } else if (display == PtsProgressDisplay::Marquee && trackWidth > 0) {
+            const UINT dpi = state ? state->dpi : 96;
+            const int blockWidth = std::max(ScalePtsMetric(28, dpi), trackWidth / 5);
+            const int span = trackWidth + blockWidth;
+            const int head = (state->marqueeOffset % span) - blockWidth;
+            for (int block = 0; block < 2; ++block) {
+                const int x = head + block * (span / 2);
+                const int blockLeft = fill.left + std::clamp(x, 0, trackWidth);
+                const int blockRight = fill.left + std::clamp(x + blockWidth, 0, trackWidth);
+                if (blockRight > blockLeft) {
+                    FillSolidRect(hdc, RECT{blockLeft, fill.top, blockRight, fill.bottom},
+                                  kPtsProgressFillColor);
+                }
+            }
         }
 
         EndPaint(hwnd, &ps);
@@ -5533,7 +6132,9 @@ private:
         bool pressed = (di->itemState & ODS_SELECTED) != 0;
         bool disabled = (di->itemState & ODS_DISABLED) != 0;
         bool focused = (di->itemState & ODS_FOCUS) != 0;
-        bool hot = !disabled && (di->itemState & ODS_HOTLIGHT) != 0;
+        bool hot = ButtonHoverEffectActive((di->itemState & ODS_HOTLIGHT) != 0, disabled,
+                                           GetCapture() != nullptr,
+                                           CursorIsOverWindow(di->hwndItem));
         RECT rc = di->rcItem;
 
         COLORREF fill = disabled ? RGB(8, 8, 8) : (hot ? kButtonHoverColor : kButtonColor);
@@ -5555,8 +6156,10 @@ private:
         HFONT controlFont = reinterpret_cast<HFONT>(
             SendMessageW(di->hwndItem, WM_GETFONT, 0, 0));
         HGDIOBJ oldFont = SelectObject(di->hDC, controlFont ? controlFont : font_);
+        InflateRect(&textRc, -2, 0);
         DrawTextW(di->hDC, text, -1, &textRc,
-                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX |
+                      DT_END_ELLIPSIS);
         if (focused && !disabled) {
             RECT focus = rc;
             InflateRect(&focus, -4, -4);
@@ -6815,28 +7418,53 @@ private:
     void UpdatePtsProgress(PtsDialogState* state, int percent, const std::wstring& message,
                            bool pumpMessages = true) {
         if (!state || !state->dialog) return;
-        int nextProgress = std::clamp(percent, 0, 100);
-        ULONGLONG now = GetTickCount64();
-        bool terminal = nextProgress == 0 || nextProgress == 100;
-        bool changedPercent = nextProgress != state->progress;
-        bool dueForPaint = terminal || changedPercent ||
-                           now - state->lastProgressPaint >= 75;
-        state->progress = nextProgress;
-        if (!dueForPaint) return;
-
-        std::wstring compactMessage = CompactPtsNotice(message);
-        state->lastProgressPaint = now;
-        state->lastProgressMessage = compactMessage;
-        if (state->status) SetWindowTextW(state->status, compactMessage.c_str());
-        if (state->percent) {
-            std::wstring pct = std::to_wstring(state->progress) + L"%";
-            SetWindowTextW(state->percent, pct.c_str());
+        const PtsProgressDisplay display =
+            state->busy
+                ? (percent > 0 ? PtsProgressDisplay::Determinate : PtsProgressDisplay::Marquee)
+                : PtsProgressDisplay::Idle;
+        const int previousShown = state->shownProgress;
+        if (display == PtsProgressDisplay::Determinate) {
+            state->shownProgress = AdvancePtsShownPercent(percent, previousShown);
         }
-        InvalidateRect(state->dialog, &state->progressRect, TRUE);
+        const bool changedDisplay = display != state->display;
+        const bool changedPercent = state->shownProgress != previousShown;
+        state->display = display;
+        ULONGLONG now = GetTickCount64();
+        if (!changedDisplay && !changedPercent &&
+            now - state->lastProgressPaint < 75) {
+            return;
+        }
+        state->lastProgressPaint = now;
+
+        state->lastProgressMessage = CompactPtsNotice(message);
+        if (state->status) SetWindowTextW(state->status, state->lastProgressMessage.c_str());
+        if (state->percent) {
+            SetWindowTextW(state->percent, PtsPercentLabelText(state->display,
+                                                               state->shownProgress).c_str());
+        }
+        InvalidateRect(state->dialog, &state->progressRect, FALSE);
         UpdateWindow(state->dialog);
         if (state->status) UpdateWindow(state->status);
         if (state->percent) UpdateWindow(state->percent);
         if (pumpMessages) PumpPtsDialogMessages(state->dialog);
+    }
+
+    void CompletePtsProgress(PtsDialogState* state, bool succeeded,
+                             const std::wstring& message) {
+        if (!state || !state->dialog) return;
+        state->display = succeeded ? PtsProgressDisplay::Done : PtsProgressDisplay::Idle;
+        state->shownProgress = succeeded ? 100 : 0;
+        state->lastProgressPaint = GetTickCount64();
+        state->lastProgressMessage = CompactPtsNotice(message);
+        if (state->status) SetWindowTextW(state->status, state->lastProgressMessage.c_str());
+        if (state->percent) {
+            SetWindowTextW(state->percent, PtsPercentLabelText(state->display,
+                                                               state->shownProgress).c_str());
+        }
+        InvalidateRect(state->dialog, &state->progressRect, FALSE);
+        UpdateWindow(state->dialog);
+        if (state->status) UpdateWindow(state->status);
+        if (state->percent) UpdateWindow(state->percent);
     }
 
     void SetPtsDialogBusy(PtsDialogState* state, bool busy) {
@@ -6849,6 +7477,21 @@ private:
         if (state->close) {
             EnableWindow(state->close, TRUE);
             SetWindowTextW(state->close, busy ? L"Hủy" : L"Đóng");
+        }
+        if (state->dialog) {
+            if (busy) {
+                state->display = PtsProgressDisplay::Marquee;
+                state->shownProgress = 0;
+                state->marqueeOffset = 0;
+                SetTimer(state->dialog, kPtsProgressTimerId, kPtsProgressTimerIntervalMs,
+                         nullptr);
+            } else {
+                KillTimer(state->dialog, kPtsProgressTimerId);
+                state->display = PtsProgressDisplay::Idle;
+                state->shownProgress = 0;
+                if (state->percent) SetWindowTextW(state->percent, L"");
+                InvalidateRect(state->dialog, &state->progressRect, FALSE);
+            }
         }
         if (!busy) {
             state->cancelRequested = false;
@@ -6902,7 +7545,7 @@ private:
                 SetWindowTextW(state->close, L"Hoàn tất");
                 EnableWindow(state->close, FALSE);
             }
-            UpdatePtsProgress(state, state->progress,
+            UpdatePtsProgress(state, state->shownProgress,
                               L"Đang hoàn tất file sao lưu; không thể hủy ở bước cuối.",
                               false);
             SetStatus(L"Pts: đang hoàn tất bước cuối...");
@@ -6913,7 +7556,7 @@ private:
             SetWindowTextW(state->close, L"Đang dừng");
             EnableWindow(state->close, FALSE);
         }
-        UpdatePtsProgress(state, state->progress,
+        UpdatePtsProgress(state, state->shownProgress,
                           L"Đang dừng an toàn sau tệp hiện tại...", false);
         SetStatus(L"Pts: đang dừng thao tác...");
     }
@@ -6933,7 +7576,7 @@ private:
             std::wstring message = result.error.empty()
                                        ? L"Đã hủy thao tác."
                                        : result.error;
-            UpdatePtsProgress(state, state->progress, message, false);
+            CompletePtsProgress(state, false, message);
             SetStatus(kind == PtsOperationKind::Backup
                           ? L"Pts: đã hủy sao lưu."
                           : L"Pts: đã dừng khôi phục.");
@@ -6947,7 +7590,7 @@ private:
                                              ? (backup ? L"Đã sao lưu xong."
                                                        : L"Đã khôi phục xong.")
                                              : result.summary;
-            UpdatePtsProgress(state, 100, summary, false);
+            CompletePtsProgress(state, true, summary);
             SetStatus(backup ? L"Pts: đã tạo file sao lưu .afang."
                              : L"Pts: đã khôi phục xong.");
             MessageBoxW(state->dialog, summary.c_str(), title,
@@ -6957,7 +7600,7 @@ private:
             const std::wstring error = result.error.empty()
                                            ? L"Thao tác Pts thất bại."
                                            : result.error;
-            UpdatePtsProgress(state, state->progress, error, false);
+            CompletePtsProgress(state, false, error);
             SetStatus(backup ? L"Pts: sao lưu thất bại."
                              : L"Pts: khôi phục thất bại.");
             MessageBoxW(state->dialog, error.c_str(), title,
@@ -7109,6 +7752,449 @@ private:
         return state.accepted;
     }
 
+    void ToggleFontPickItem(FontPickDialogState* state, int row) {
+        if (!state || row < 0 || static_cast<size_t>(row) >= state->filtered.size()) {
+            return;
+        }
+        size_t globalIndex = static_cast<size_t>(state->filtered[row]);
+        if (globalIndex >= state->selected.size()) return;
+        state->selected[globalIndex] = !state->selected[globalIndex];
+        RefreshFontPickSelectionUi(state);
+    }
+
+    bool FontPickAllFilteredSelected(const FontPickDialogState* state) const {
+        if (!state || state->filtered.empty()) return false;
+        for (int globalIndex : state->filtered) {
+            if (globalIndex < 0 ||
+                static_cast<size_t>(globalIndex) >= state->selected.size() ||
+                !state->selected[static_cast<size_t>(globalIndex)]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void ApplyFontPickFilterSelect(FontPickDialogState* state, bool select) {
+        if (!state) return;
+        for (int globalIndex : state->filtered) {
+            if (globalIndex >= 0 &&
+                static_cast<size_t>(globalIndex) < state->selected.size()) {
+                state->selected[static_cast<size_t>(globalIndex)] = select;
+            }
+        }
+        RefreshFontPickSelectionUi(state);
+    }
+
+    void RebuildFontPickFoldedCache(FontPickDialogState* state) {
+        if (!state || !state->items) return;
+        state->foldedCache.clear();
+        state->foldedCache.reserve(state->items->size());
+        for (const auto& item : *state->items) {
+            state->foldedCache.emplace_back(FoldPtsFontSearchKey(item.displayName),
+                                            FoldPtsFontSearchKey(
+                                                FileNameOnly(item.sourcePath)));
+        }
+    }
+
+    void ApplyFontPickSearch(FontPickDialogState* state) {
+        if (!state || !state->items || !state->list) return;
+        wchar_t buffer[256] = {};
+        int length = state->search ? GetWindowTextW(state->search, buffer, 256) : 0;
+        std::wstring queryText(buffer, buffer + std::max(0, length));
+        PtsFontQuery query = ParsePtsFontQuery(queryText);
+
+        if (state->foldedCache.size() != state->items->size()) {
+            RebuildFontPickFoldedCache(state);
+        }
+
+        std::vector<int> next;
+        next.reserve(state->items->size());
+        for (size_t i = 0; i < state->items->size(); ++i) {
+            const auto& folded = state->foldedCache[i];
+            if (query.tokens.empty() ||
+                PtsFontMatchesQueryFolded(query, folded.first, folded.second)) {
+                next.push_back(static_cast<int>(i));
+            }
+        }
+        if (next == state->filtered) return;  // refinement changed nothing; skip rebuild
+        state->filtered = std::move(next);
+        RebuildFontPickList(state);
+        RefreshFontPickSelectionUi(state);
+    }
+
+    void RebuildFontPickList(FontPickDialogState* state) {
+        if (!state || !state->list) return;
+        SendMessageW(state->list, WM_SETREDRAW, FALSE, 0);
+        SendMessageW(state->list, LB_RESETCONTENT, 0, 0);
+        if (state->filtered.empty()) {
+            SendMessageW(state->list, LB_ADDSTRING, 0,
+                         reinterpret_cast<LPARAM>(L"Không có font khớp từ khóa."));
+        } else {
+            for (int globalIndex : state->filtered) {
+                const std::wstring& name = (*state->items)[globalIndex].displayName;
+                SendMessageW(state->list, LB_ADDSTRING, 0,
+                             reinterpret_cast<LPARAM>(name.c_str()));
+            }
+            SendMessageW(state->list, LB_SETCURSEL, 0, 0);
+        }
+        SendMessageW(state->list, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(state->list, nullptr, FALSE);
+    }
+
+    void OnFontPickDeleteRequested(FontPickDialogState* state) {
+        if (!state || !state->items || !state->dialog || state->deleting) return;
+        size_t selectedCount = 0;
+        for (size_t i = 0; i < state->items->size() && i < state->selected.size(); ++i) {
+            if (state->selected[i]) ++selectedCount;
+        }
+        if (selectedCount == 0) return;
+
+        std::wstring confirm =
+            L"Xóa " + std::to_wstring(selectedCount) +
+            L" font khỏi máy tính?\nFile font và đăng ký Windows sẽ bị gỡ."
+            L"\nHành động này không thể hoàn tác.";
+        if (MessageBoxW(state->dialog, confirm.c_str(), L"Xóa font",
+                        MB_YESNO | MB_ICONWARNING | MB_SETFOREGROUND |
+                            (topMost_ ? MB_TOPMOST : 0)) != IDYES) {
+            return;
+        }
+        if (!IsWindow(state->dialog)) return;
+
+        state->deleting = true;
+        for (HWND button : {state->deleteButton, state->ok}) {
+            if (button) EnableWindow(button, FALSE);
+        }
+
+        SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+        uint32_t deleted = 0;
+        uint32_t failed = 0;
+        uint32_t pendingFiles = 0;
+        std::wstring firstError;
+        std::set<size_t> removed;
+        size_t processed = 0;
+        for (size_t i = 0; i < state->items->size() && i < state->selected.size(); ++i) {
+            if (!state->selected[i]) continue;
+            ++processed;
+            if (state->summary) {
+                SetWindowTextW(state->summary,
+                               (L"Đang xóa font " + std::to_wstring(processed) + L"/" +
+                                std::to_wstring(selectedCount) + L"...")
+                                   .c_str());
+            }
+            // Keep painting and input alive while the batch runs.
+            PumpPtsDialogMessages(state->dialog);
+            if (!IsWindow(state->dialog)) {
+                SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+                state->deleting = false;
+                return;
+            }
+
+            PtsFontRemovalResult result = RemoveInstalledFont((*state->items)[i].sourcePath);
+            if (result.uninstalled) {
+                ++deleted;
+                removed.insert(i);
+                if (result.filePendingReboot) ++pendingFiles;
+            } else {
+                ++failed;
+                if (firstError.empty() && !result.error.empty()) firstError = result.error;
+            }
+        }
+        if (deleted > 0) BroadcastPtsFontChange();
+        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+        if (!IsWindow(state->dialog)) {
+            state->deleting = false;
+            return;
+        }
+        state->deleting = false;
+        RefreshFontPickSelectionUi(state);
+
+        if (!removed.empty()) {
+            std::vector<PtsBackupItem> keptItems;
+            std::vector<bool> keptSelected;
+            keptItems.reserve(state->items->size() - removed.size());
+            for (size_t i = 0; i < state->items->size(); ++i) {
+                if (removed.count(i)) continue;
+                if (i < state->selected.size()) {
+                    keptItems.push_back(std::move((*state->items)[i]));
+                    keptSelected.push_back(state->selected[i]);
+                }
+            }
+            state->items->swap(keptItems);
+            state->selected.swap(keptSelected);
+            RebuildFontPickFoldedCache(state);
+            ApplyFontPickSearch(state);
+            RefreshFontPickSelectionUi(state);
+        }
+
+        std::wstring summary = FormatPtsFontDeleteSummary(deleted, failed);
+        if (pendingFiles > 0) {
+            summary += L"\n" + std::to_wstring(pendingFiles) +
+                       L" file còn bị Windows giữ; khởi động lại máy để dọn sạch.";
+        }
+        if (!firstError.empty()) summary += L"\n" + firstError;
+        UINT icon = failed > 0 ? MB_ICONWARNING : MB_ICONINFORMATION;
+        MessageBoxW(state->dialog, summary.c_str(), L"Xóa font",
+                    MB_OK | icon | MB_SETFOREGROUND |
+                        (topMost_ ? MB_TOPMOST : 0));
+    }
+
+    void RefreshFontPickSelectionUi(FontPickDialogState* state) {
+        if (!state || !state->items) return;
+        size_t selectedCount = 0;
+        uint64_t selectedBytes = 0;
+        for (size_t i = 0; i < state->items->size() && i < state->selected.size(); ++i) {
+            if (state->selected[i]) {
+                ++selectedCount;
+                selectedBytes += (*state->items)[i].size;
+            }
+        }
+        if (state->summary) {
+            SetWindowTextW(state->summary,
+                           FormatPtsFontSelectionSummary(selectedCount, state->items->size(),
+                                                         selectedBytes).c_str());
+        }
+        if (state->ok) {
+            EnableWindow(state->ok, selectedCount > 0 ? TRUE : FALSE);
+        }
+        if (state->deleteButton) {
+            SetWindowTextW(state->deleteButton,
+                           FormatPtsFontDeleteButtonText(selectedCount).c_str());
+            EnableWindow(state->deleteButton, selectedCount > 0 ? TRUE : FALSE);
+        }
+        if (state->list) InvalidateRect(state->list, nullptr, FALSE);
+    }
+
+    void DrawFontPickListRow(FontPickDialogState* state, DRAWITEMSTRUCT* di) {
+        if (!state || !state->items || !di) return;
+        if (di->itemID == UINT_MAX) return;
+        RECT rc = di->rcItem;
+        FillSolidRect(di->hDC, rc, kPanelColor);
+
+        HFONT controlFont = reinterpret_cast<HFONT>(
+            SendMessageW(state->list, WM_GETFONT, 0, 0));
+        HGDIOBJ oldFont = SelectObject(di->hDC, controlFont ? controlFont : font_);
+        SetBkMode(di->hDC, TRANSPARENT);
+
+        if (state->filtered.empty()) {
+            SetTextColor(di->hDC, RGB(168, 178, 181));
+            RECT textRc = rc;
+            DrawTextW(di->hDC, L"Không có font khớp từ khóa.", -1, &textRc,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            SelectObject(di->hDC, oldFont);
+            return;
+        }
+
+        if (di->itemID >= state->filtered.size()) {
+            SelectObject(di->hDC, oldFont);
+            return;
+        }
+        size_t index = static_cast<size_t>(state->filtered[di->itemID]);
+        if (index >= state->items->size()) {
+            SelectObject(di->hDC, oldFont);
+            return;
+        }
+        const PtsBackupItem& item = (*state->items)[index];
+        const bool checked = index < state->selected.size() && state->selected[index];
+
+        const int box = ScalePtsMetric(13, state->dpi);
+        RECT checkbox = rc;
+        checkbox.left = rc.left + ScalePtsMetric(10, state->dpi);
+        checkbox.top = rc.top + std::max(0, (RectHeight(rc) - box) / 2);
+        checkbox.right = checkbox.left + box;
+        checkbox.bottom = checkbox.top + box;
+        FillSolidRect(di->hDC, checkbox, RGB(22, 22, 22));
+        DrawCrispOnePixelBorder(di->hDC, checkbox, kBorderColor);
+        if (checked) {
+            RECT inner = checkbox;
+            InflateRect(&inner, -ScalePtsMetric(3, state->dpi),
+                        -ScalePtsMetric(3, state->dpi));
+            FillSolidRect(di->hDC, inner, kPtsProgressFillColor);
+        }
+
+        SetTextColor(di->hDC, kTextColor);
+        RECT nameRc = rc;
+        nameRc.left = checkbox.right + ScalePtsMetric(10, state->dpi);
+        nameRc.right = rc.right - ScalePtsMetric(104, state->dpi);
+        DrawTextW(di->hDC, item.displayName.c_str(), -1, &nameRc,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        RECT sizeRc = rc;
+        sizeRc.left = rc.right - ScalePtsMetric(100, state->dpi);
+        sizeRc.right = rc.right - ScalePtsMetric(10, state->dpi);
+        SetTextColor(di->hDC, RGB(168, 178, 181));
+        DrawTextW(di->hDC, FormatBytes(item.size).c_str(), -1, &sizeRc,
+                  DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        if (di->itemState & ODS_FOCUS) DrawFocusRect(di->hDC, &rc);
+        SelectObject(di->hDC, oldFont);
+    }
+
+    bool PromptForFontSelection(HWND owner, std::vector<PtsBackupItem>& items) {
+        if (items.empty()) {
+            std::wstring notice =
+                L"Không tìm thấy font tùy chỉnh nào để sao lưu.\n"
+                L"Font mặc định của Windows đã được bỏ qua.";
+            MessageBoxW(owner ? owner : hwnd_, notice.c_str(), L"Sao lưu font",
+                        MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND |
+                            (topMost_ ? MB_TOPMOST : 0));
+            return false;
+        }
+
+        WNDCLASSW wc{};
+        if (!GetClassInfoW(instance_, L"ToolTypeFontPickDialog", &wc)) {
+            wc.lpfnWndProc = &ToolTypeApp::FontPickDialogWndProc;
+            wc.hInstance = instance_;
+            wc.lpszClassName = L"ToolTypeFontPickDialog";
+            wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+            wc.hbrBackground = nullptr;
+            if (!RegisterClassW(&wc)) return false;
+        }
+
+        HWND parent = owner ? owner : hwnd_;
+        FontPickDialogState state{};
+        state.app = this;
+        state.items = &items;
+        state.selected.assign(items.size(), true);
+
+        const UINT dpi = QueryPtsDialogDpi(parent);
+        state.dpi = dpi;
+        const PtsFontPickLayout layout = CalculateFontPickDialogLayout(dpi);
+
+        DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_BORDER;
+        RECT desiredClient{0, 0, layout.clientWidth, layout.clientHeight};
+        AdjustWindowRectEx(&desiredClient, style, FALSE, PtsDialogExtendedStyle(topMost_));
+        int width = RectWidth(desiredClient);
+        int height = RectHeight(desiredClient);
+
+        RECT ownerRc{};
+        GetWindowRect(parent, &ownerRc);
+        int x = ownerRc.left + (RectWidth(ownerRc) - width) / 2;
+        int y = ownerRc.top + (RectHeight(ownerRc) - height) / 2;
+        MONITORINFO monitorInfo{};
+        monitorInfo.cbSize = sizeof(monitorInfo);
+        HMONITOR monitor = MonitorFromWindow(parent, MONITOR_DEFAULTTONEAREST);
+        if (monitor && GetMonitorInfoW(monitor, &monitorInfo)) {
+            int maxX = std::max(monitorInfo.rcWork.left, monitorInfo.rcWork.right - width);
+            int maxY = std::max(monitorInfo.rcWork.top, monitorInfo.rcWork.bottom - height);
+            x = std::clamp(x, static_cast<int>(monitorInfo.rcWork.left), maxX);
+            y = std::clamp(y, static_cast<int>(monitorInfo.rcWork.top), maxY);
+        }
+        HWND dialog = CreateWindowExW(PtsDialogExtendedStyle(topMost_),
+                                      L"ToolTypeFontPickDialog", L"Chọn font để sao lưu",
+                                      style, x, y, width, height, parent, nullptr,
+                                      instance_, &state);
+        if (!dialog) return false;
+        state.dialog = dialog;
+        HFONT dialogFont = CreatePtsDialogFont(font_, dpi);
+        HFONT controlFont = dialogFont ? dialogFont : font_;
+
+        auto left = [](const RECT& rect) { return static_cast<int>(rect.left); };
+        auto top = [](const RECT& rect) { return static_cast<int>(rect.top); };
+        auto widthOf = [](const RECT& rect) { return static_cast<int>(rect.right - rect.left); };
+        auto heightOf = [](const RECT& rect) {
+            return static_cast<int>(rect.bottom - rect.top);
+        };
+
+        HWND title = CreateWindowExW(
+            0, L"STATIC", L"Chọn font đưa vào file sao lưu .afang",
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX, left(layout.title),
+            top(layout.title), widthOf(layout.title), heightOf(layout.title), dialog,
+            nullptr, instance_, nullptr);
+        HWND prompt = CreateWindowExW(
+            0, L"STATIC", L"Bỏ chọn các font không cần. Font mặc định của Windows đã bị loại bỏ.",
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX, left(layout.prompt),
+            top(layout.prompt), widthOf(layout.prompt), heightOf(layout.prompt), dialog,
+            nullptr, instance_, nullptr);
+        state.list = CreateWindowExW(
+            0, L"LISTBOX", nullptr,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WS_VSCROLL |
+                LBS_OWNERDRAWFIXED | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+            left(layout.list), top(layout.list), widthOf(layout.list), heightOf(layout.list),
+            dialog, nullptr, instance_, nullptr);
+        state.search = CreateWindowExW(
+            0, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL |
+                ES_LEFT,
+            left(layout.search), top(layout.search), widthOf(layout.search),
+            heightOf(layout.search), dialog,
+            reinterpret_cast<HMENU>(ID_PTS_FONT_SEARCH_EDIT), instance_, nullptr);
+        state.summary = CreateWindowExW(
+            0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+            left(layout.summary), top(layout.summary), widthOf(layout.summary),
+            heightOf(layout.summary), dialog, nullptr, instance_, nullptr);
+        HWND selectAll = CreatePtsDialogButton(
+            dialog, L"Chọn tất cả", ID_PTS_FONT_SELECT_ALL, left(layout.selectAll),
+            top(layout.selectAll), widthOf(layout.selectAll), heightOf(layout.selectAll));
+        HWND selectNone = CreatePtsDialogButton(
+            dialog, L"Bỏ chọn", ID_PTS_FONT_SELECT_NONE, left(layout.selectNone),
+            top(layout.selectNone), widthOf(layout.selectNone), heightOf(layout.selectNone));
+        state.ok = CreatePtsDialogButton(
+            dialog, L"Sao lưu", IDOK, left(layout.ok), top(layout.ok), widthOf(layout.ok),
+            heightOf(layout.ok));
+        SendMessageW(state.ok, BM_SETSTYLE, BS_DEFPUSHBUTTON, static_cast<LPARAM>(TRUE));
+        HWND cancel = CreatePtsDialogButton(
+            dialog, L"Hủy", IDCANCEL, left(layout.cancel), top(layout.cancel),
+            widthOf(layout.cancel), heightOf(layout.cancel));
+        state.deleteButton = CreatePtsDialogButton(
+            dialog, L"Xóa", ID_PTS_FONT_DELETE, left(layout.deleteButton),
+            top(layout.deleteButton), widthOf(layout.deleteButton),
+            heightOf(layout.deleteButton));
+
+        for (HWND control : {title, prompt, state.list, state.search, state.summary,
+                             selectAll, selectNone, state.deleteButton, state.ok,
+                             cancel}) {
+            SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(controlFont), TRUE);
+        }
+
+        state.filtered.reserve(items.size());
+        for (size_t i = 0; i < items.size(); ++i) {
+            state.filtered.push_back(static_cast<int>(i));
+        }
+        state.originalListProc = reinterpret_cast<WNDPROC>(
+            SetWindowLongPtrW(state.list, GWLP_WNDPROC,
+                              reinterpret_cast<LONG_PTR>(&ToolTypeApp::FontPickListWndProc)));
+        SetWindowLongPtrW(state.list, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&state));
+        state.originalSearchProc = reinterpret_cast<WNDPROC>(
+            SetWindowLongPtrW(state.search, GWLP_WNDPROC,
+                              reinterpret_cast<LONG_PTR>(&ToolTypeApp::FontPickSearchWndProc)));
+        SetWindowLongPtrW(state.search, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&state));
+        InvalidateRect(state.search, nullptr, TRUE);
+        RebuildFontPickList(&state);
+        RefreshFontPickSelectionUi(&state);
+
+        EnableWindow(parent, FALSE);
+        ShowWindow(dialog, SW_SHOW);
+        SetForegroundWindow(dialog);
+        SetFocus(state.list);
+
+        MSG msg{};
+        BOOL getMessageResult = TRUE;
+        while (IsWindow(dialog) &&
+               (getMessageResult = GetMessageW(&msg, nullptr, 0, 0)) > 0) {
+            if (!IsDialogMessageW(dialog, &msg)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        if (getMessageResult == 0) {
+            if (IsWindow(dialog)) DestroyWindow(dialog);
+            PostQuitMessage(static_cast<int>(msg.wParam));
+        }
+
+        EnableWindow(parent, TRUE);
+        SetForegroundWindow(parent);
+        if (state.accepted) {
+            std::vector<PtsBackupItem> kept;
+            kept.reserve(items.size());
+            for (size_t i = 0; i < items.size(); ++i) {
+                if (i < state.selected.size() && state.selected[i]) {
+                    kept.push_back(std::move(items[i]));
+                }
+            }
+            items.swap(kept);
+        }
+        if (dialogFont) DeleteObject(dialogFont);
+        return state.accepted;
+    }
+
     void ApplyBackupVersionSelection(const PtsPhotoshopVersion& version,
                                      PtsBackupOptions& options) const {
         options.selectedPhotoshopVersionLabel = version.label;
@@ -7243,6 +8329,19 @@ private:
             return;
         }
 
+        if (includeFonts) {
+            UpdatePtsProgress(state, 0, L"Đang quét font tùy chỉnh...", false);
+            std::vector<PtsBackupItem> fontItems;
+            GatherFontItems(fontItems);
+            SortPtsFontItemsForSelection(fontItems);
+            if (!PromptForFontSelection(state ? state->dialog : hwnd_, fontItems)) {
+                UpdatePtsProgress(state, 0, L"Đã hủy chọn font sao lưu.");
+                return;
+            }
+            options.presetFontItems = std::move(fontItems);
+            options.usePresetFontItems = true;
+        }
+
         std::wstring path;
         if (!PromptForAfangSave(state ? state->dialog : hwnd_, L"Lưu file sao lưu .afang", defaultName, path)) {
             UpdatePtsProgress(state, 0, L"Đã hủy chọn file sao lưu.");
@@ -7298,7 +8397,7 @@ private:
             return IsPtsCancellationRequested(
                 std::static_pointer_cast<PtsCancellationState>(preflightCancellation));
         };
-        UpdatePtsProgress(state, state ? state->progress : 0, L"Đang kiểm tra file .afang...");
+        UpdatePtsProgress(state, 0, L"Đang kiểm tra file .afang...");
         if (!PrepareRestoreOptions(state ? state->dialog : hwnd_, path, options, prepareError,
                                    progress, cancelled)) {
             bool wasCancelled = state->cancelRequested || cancelled();
@@ -7414,6 +8513,7 @@ private:
 
         const UINT dpi = QueryPtsDialogDpi(hwnd_);
         const PtsDialogLayout layout = CalculatePtsDialogLayout(dpi);
+        state.dpi = dpi;
         DWORD exStyle = PtsDialogExtendedStyle(topMost_);
         DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_BORDER | WS_CLIPCHILDREN;
         RECT desiredClient{0, 0, layout.clientWidth, layout.clientHeight};
@@ -7475,7 +8575,7 @@ private:
                                        left(layout.status), top(layout.status),
                                        widthOf(layout.status), heightOf(layout.status), dialog,
                                        nullptr, instance_, nullptr);
-        state.percent = CreateWindowExW(0, L"STATIC", L"0%",
+        state.percent = CreateWindowExW(0, L"STATIC", L"",
                                         WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_NOPREFIX,
                                         left(layout.percent), top(layout.percent),
                                         widthOf(layout.percent), heightOf(layout.percent), dialog,

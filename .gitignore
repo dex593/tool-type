@@ -1,4 +1,4 @@
-ToolType.exe
+*.exe
 ToolType.ini
 resource.res
 *.o

@@ -243,6 +243,261 @@ void TestCompactPtsNoticeMarksOmittedDetails() {
            "Pts popup hid the non-rollback warning after a partial restore");
 }
 
+void TestPtsProgressDisplayIsMonotonicAndNeverStale() {
+    Expect(AdvancePtsShownPercent(8, 12) == 12,
+           "Pts progress bar still jumps backward between workflow phases");
+    Expect(AdvancePtsShownPercent(14, 12) == 14,
+           "Pts progress bar ignored a forward progress update");
+    Expect(AdvancePtsShownPercent(0, 12) == 12,
+           "a zero percent report reset visible progress mid-operation");
+    Expect(AdvancePtsShownPercent(150, 12) == 100 && AdvancePtsShownPercent(-3, 0) == 0,
+           "Pts progress display left the 0..100 range");
+
+    Expect(PtsPercentLabelText(PtsProgressDisplay::Idle, 37).empty() &&
+               PtsPercentLabelText(PtsProgressDisplay::Marquee, 37).empty(),
+           "Pts popup still shows a stale percentage while idle or waiting for the first report");
+    Expect(PtsPercentLabelText(PtsProgressDisplay::Determinate, 37) == L"37%",
+           "Pts determinate percentage label lost its value");
+    Expect(PtsPercentLabelText(PtsProgressDisplay::Done, 99) == L"100%",
+           "a completed Pts operation does not read as 100%");
+}
+
+void TestPtsCompletionSummariesAreConcise() {
+    const uint64_t settingsBytes = 348160;
+    const uint64_t fontBytes = 35651584;
+
+    const std::wstring settingsBackup = FormatPtsBackupSummary(120, settingsBytes, 0, 0,
+                                                               L"Photoshop CS6", 0);
+    Expect(settingsBackup == L"Đã sao lưu, " + FormatBytes(settingsBytes) +
+                               L", Photoshop CS6.",
+           "settings backup summary is not the concise size + version form");
+
+    const std::wstring fontsBackup = FormatPtsBackupSummary(0, 0, 24, fontBytes, L"", 0);
+    Expect(fontsBackup == L"Đã sao lưu 24 font, " + FormatBytes(fontBytes) + L".",
+           "font backup summary is not the concise count + size form");
+
+    const std::wstring combinedBackup = FormatPtsBackupSummary(120, settingsBytes, 24,
+                                                               fontBytes, L"Photoshop CS6", 0);
+    Expect(combinedBackup == L"Đã sao lưu, " + FormatBytes(settingsBytes) + L", 24 font, " +
+                                 FormatBytes(fontBytes) + L", Photoshop CS6.",
+           "combined backup summary does not join both categories concisely");
+
+    Expect(FormatPtsBackupSummary(120, settingsBytes, 0, 0, L"Photoshop CS6", 2)
+               .find(L"Bỏ qua 2 file.") != std::wstring::npos,
+           "backup summary dropped the skipped-file note");
+
+    const std::wstring settingsRestore = FormatPtsRestoreSummary(
+        120, 0, L"Photoshop 2025 → Photoshop CS6", 0, 0);
+    Expect(settingsRestore ==
+               L"Đã khôi phục 120 file cài đặt, Photoshop 2025 → Photoshop CS6.",
+           "settings restore summary must show the file count and version, not bytes");
+
+    const std::wstring fontsRestore = FormatPtsRestoreSummary(0, 24, L"", 2, 0);
+    Expect(fontsRestore == L"Đã khôi phục 24 font. Bỏ qua 2 font đã có.",
+           "font restore summary is not the plain font-count form with skip note");
+
+    const std::wstring combinedRestore = FormatPtsRestoreSummary(
+        120, 24, L"Photoshop CS6", 0, 3);
+    Expect(combinedRestore == L"Đã khôi phục 120 file cài đặt, 24 font, Photoshop CS6."
+                                   L" Bỏ qua 3 mục khác phiên bản.",
+           "combined restore summary does not join both counts concisely");
+}
+
+void TestFontSelectionPopupHelpers() {
+    Expect(IsDefaultWindowsFont(L"arial.ttf", L"Arial Bold Italic"),
+           "Windows default font was offered for custom selection");
+    Expect(IsDefaultWindowsFont(L"segoeui.ttf", L"Segoe UI"),
+           "Segoe UI was not treated as a Windows default font");
+    Expect(!IsDefaultWindowsFont(L"svngilroy-bold.ttf", L"SVN Gilroy Bold"),
+           "a custom font was wrongly classified as a Windows default");
+    Expect(!IsDefaultWindowsFont(L"bevietnam-pro.ttf", L"Be Vietnam Pro"),
+           "a custom font was wrongly classified as a Windows default");
+
+    Expect(FormatPtsFontSelectionSummary(3, 24, 2516582) ==
+               L"Đã chọn 3/24 font — " + FormatBytes(2516582),
+           "font selection summary lost its selected/total counts or size");
+
+    Expect(PtsFontMatchesQuery(L"", L"Anything", L"any.ttf"),
+           "empty font search dropped every font");
+    Expect(PtsFontMatchesQuery(L"gilroy bold", L"SVN Gilroy Bold", L"SVNGilroy-Bold.ttf"),
+           "multi-word font search stopped matching name and file");
+    Expect(!PtsFontMatchesQuery(L"gi bo", L"SVN Gilroy Bold", L"SVNGilroy-Bold.ttf"),
+           "search ignored its space and matched across word boundaries");
+    Expect(PtsFontMatchesQuery(L"SJ ", L"SJ abc", L"SJabc.ttf"),
+           "trailing space query stopped matching a following space in the name");
+    Expect(!PtsFontMatchesQuery(L"SJ ", L"SJabc", L"SJabc.ttf"),
+           "trailing space query matched a name without any space");
+    Expect(!PtsFontMatchesQuery(L"sj ", L"Boxing Wizards", L"BoxingWizards.ttf"),
+           "trailing space query matched a completely unrelated font");
+    Expect(PtsFontMatchesQuery(L"boxing", L"Boxing Wizards", L"BoxingWizards.ttf"),
+           "single word query stopped matching the display name");
+    Expect(PtsFontMatchesQuery(L"bold", L"Family", L"SVNGilroy-Bold.ttf"),
+           "token did not match at a word start inside the file name");
+    Expect(IsFontWordSeparator(L'-') && IsFontWordSeparator(L'.') &&
+               IsFontWordSeparator(L'_') && !IsFontWordSeparator(L'a'),
+           "font word separator set is wrong");
+    Expect(PtsFontMatchesQuery(L"ttf", L"Family Name", L"MyFont.ttf"),
+           "searching by file name stopped working");
+    Expect(!PtsFontMatchesQuery(L"khongco", L"SVN Gilroy Bold", L"SVNGilroy-Bold.ttf"),
+           "non-matching font search still returned hits");
+    Expect(FoldPtsFontSearchKey(L"Đậm Vách Đẹp") == L"dam vach dep",
+           "font search key did not fold Vietnamese diacritics");
+    Expect(PtsFontMatchesQuery(L"dam", L"Đậm Vách", L"DamVach.ttf"),
+           "accented query did not match plain letters");
+    Expect(PtsFontMatchesQuery(L"đ", L"Đậm Vách", L"DamVach.ttf"),
+           "plain-letter query did not match accented font name");
+
+    Expect(FormatPtsFontDeleteButtonText(4) == L"Xóa (4)",
+           "font delete button does not show the selected count");
+    Expect(FormatPtsFontDeleteSummary(3, 0) == L"Đã xóa 3 font.",
+           "font delete summary lost the deleted count");
+    Expect(FormatPtsFontDeleteSummary(3, 2) == L"Đã xóa 3 font, 2 font không xóa được.",
+           "font delete summary hid failures");
+
+    std::vector<PtsBackupItem> fonts;
+    PtsBackupItem b{};
+    b.kind = PtsEntryKind::Font;
+    b.sourcePath = L"C:\\tmp\\zeta.ttf";
+    b.displayName = L"Zeta Sans";
+    fonts.push_back(b);
+    b.sourcePath = L"C:\\tmp\\alpha.ttf";
+    b.displayName = L"alpha face";
+    fonts.push_back(b);
+    b.sourcePath = L"C:\\tmp\\mid.ttf";
+    b.displayName = L"Mid Font";
+    fonts.push_back(b);
+    SortPtsFontItemsForSelection(fonts);
+    Expect(fonts[0].displayName == L"alpha face" && fonts[1].displayName == L"Mid Font" &&
+               fonts[2].displayName == L"Zeta Sans",
+           "font selection list is not sorted case-insensitively by display name");
+}
+
+void TestFontPickDialogLayoutIsDpiScaledAndSeparated() {
+    const PtsFontPickLayout baseline = CalculateFontPickDialogLayout(96);
+    for (UINT dpi : {96u, 120u, 144u, 192u}) {
+        const PtsFontPickLayout layout = CalculateFontPickDialogLayout(dpi);
+        Expect(layout.clientWidth == ScalePtsMetric(baseline.clientWidth, dpi) &&
+                   layout.clientHeight == ScalePtsMetric(baseline.clientHeight, dpi),
+               "font pick dialog client size is not DPI-scaled");
+        ExpectRectScalesFrom96Dpi(baseline.prompt, layout.prompt, dpi,
+                                  "font pick prompt rect is not DPI-scaled");
+        ExpectRectScalesFrom96Dpi(baseline.search, layout.search, dpi,
+                                  "font pick search rect is not DPI-scaled");
+        ExpectRectScalesFrom96Dpi(baseline.list, layout.list, dpi,
+                                  "font pick list rect is not DPI-scaled");
+        ExpectRectScalesFrom96Dpi(baseline.summary, layout.summary, dpi,
+                                  "font pick summary rect is not DPI-scaled");
+        ExpectRectScalesFrom96Dpi(baseline.deleteButton, layout.deleteButton, dpi,
+                                  "font pick delete rect is not DPI-scaled");
+        ExpectRectScalesFrom96Dpi(baseline.ok, layout.ok, dpi,
+                                  "font pick ok rect is not DPI-scaled");
+        ExpectRectScalesFrom96Dpi(baseline.cancel, layout.cancel, dpi,
+                                  "font pick cancel rect is not DPI-scaled");
+
+        const int outerMargin = ScalePtsMetric(14, dpi);
+        Expect(!RectanglesOverlap(layout.title, layout.prompt) &&
+                   !RectanglesOverlap(layout.prompt, layout.search) &&
+                   !RectanglesOverlap(layout.search, layout.list) &&
+                   !RectanglesOverlap(layout.list, layout.summary) &&
+                   !RectanglesOverlap(layout.summary, layout.selectAll) &&
+                   !RectanglesOverlap(layout.selectAll, layout.selectNone) &&
+                   !RectanglesOverlap(layout.selectNone, layout.deleteButton) &&
+                   !RectanglesOverlap(layout.deleteButton, layout.cancel) &&
+                   !RectanglesOverlap(layout.cancel, layout.ok) &&
+                   !RectanglesOverlap(layout.ok, layout.cancel),
+               "font pick dialog controls overlap");
+        Expect(layout.list.bottom - layout.list.top >= ScalePtsMetric(200, dpi),
+               "font pick list is too short to be usable");
+        Expect(layout.search.top - layout.prompt.bottom >= ScalePtsMetric(4, dpi) &&
+                   layout.list.top - layout.search.bottom >= ScalePtsMetric(4, dpi) &&
+                   layout.summary.top - layout.list.bottom >= ScalePtsMetric(4, dpi),
+               "font pick search box crowds the prompt or the list");
+        Expect(layout.cancel.bottom + outerMargin <= layout.clientHeight &&
+                   layout.ok.bottom + outerMargin <= layout.clientHeight,
+               "font pick buttons do not fit inside the client area");
+    }
+}
+
+void TestHoverEffectIsNotRetainedAfterClick() {
+    Expect(ButtonHoverEffectActive(true, false, false, true),
+           "hover style stopped showing for a resting mouse over a button");
+    Expect(!ButtonHoverEffectActive(true, false, true, true),
+           "hover style stayed visible while the button was captured mid-click");
+    Expect(!ButtonHoverEffectActive(true, false, false, false),
+           "hover style stuck after the mouse left the button");
+    Expect(!ButtonHoverEffectActive(true, true, false, true),
+           "disabled button showed a hover effect");
+    Expect(!ButtonHoverEffectActive(false, false, false, true),
+           "hover style appeared without any hot state");
+}
+
+void TestDeleteInstalledFontRemovesRegistryEntryAndFile() {
+    namespace fs = std::filesystem;
+    fs::path root = fs::temp_directory_path() / L"tooltype-pts-font-delete";
+    std::error_code ignored;
+    fs::remove_all(root, ignored);
+    fs::create_directories(root);
+    fs::path font = root / L"ToolType-DeleteProbe.ttf";
+    {
+        std::ofstream out(font, std::ios::binary);
+        out << "delete-probe";
+    }
+
+    HKEY fontsKey = nullptr;
+    Expect(RegOpenKeyExW(HKEY_CURRENT_USER,
+                         L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Fonts", 0,
+                         KEY_SET_VALUE | KEY_READ,
+                         &fontsKey) == ERROR_SUCCESS,
+           "could not open user Fonts registry for the delete probe");
+    ScopedRegistryValues scoped(fontsKey);
+    const std::wstring valueName = L"ToolType Delete Probe (TrueType)";
+    Expect(RegSetValueExW(fontsKey, valueName.c_str(), 0, REG_SZ,
+                          reinterpret_cast<const BYTE*>(font.wstring().c_str()),
+                          static_cast<DWORD>((font.wstring().size() + 1) *
+                                             sizeof(wchar_t))) == ERROR_SUCCESS,
+           "could not stage the user font registry value");
+    scoped.Add(valueName);
+
+    std::wstring foundName;
+    Expect(FindFontRegistryValue(HKEY_CURRENT_USER, true, font.wstring(), foundName) &&
+               foundName == valueName,
+           "font registry lookup could not find the staged value");
+
+    std::wstring error;
+    Expect(DeleteInstalledFontFile(font.wstring(), error),
+           "font delete failed: registry or file removal errored");
+    Expect(!fs::exists(font), "font file survived deletion");
+
+    std::wstring shouldBeGone;
+    Expect(!FindFontRegistryValue(HKEY_CURRENT_USER, true, font.wstring(),
+                                  shouldBeGone),
+           "font registry value survived deletion");
+
+    PtsBackupItem item{};
+    item.kind = PtsEntryKind::Font;
+    item.sourcePath = (root / L"Missing.ttf").wstring();
+    item.displayName = L"Missing";
+    item.size = 1;
+    std::wstring missingError;
+    Expect(DeleteInstalledFontFile(item.sourcePath, missingError),
+           "deleting an already absent font file must stay a no-op success");
+
+    fs::remove_all(root, ignored);
+}
+
+void TestCompactPtsNoticeKeepsTypicalPhaseMessage() {
+    const std::wstring phaseMessage = L"Đang nén Photoshop WorkspaceLayout (12/34)...";
+    const std::wstring notice = CompactPtsNotice(phaseMessage);
+    Expect(notice == phaseMessage,
+           "Pts live notice still wraps or truncates a message that fits one status line");
+
+    const std::wstring twoLineMessage =
+        L"Đang khôi phục file 12/200: Photoshop 2025 ActionsPalette.psp";
+    const std::wstring compact = CompactPtsNotice(twoLineMessage);
+    Expect(std::count(compact.begin(), compact.end(), L'\n') <= 1,
+           "Pts live notice exceeds its two-line status area");
+}
+
 void TestPtsDialogLoopPreservesQuitAndDestroysWindow() {
     HWND window = CreateWindowExW(0, L"STATIC", L"Pts loop probe", WS_POPUP,
                                   0, 0, 10, 10, nullptr, nullptr,
@@ -435,6 +690,66 @@ bool ArchiveContainsRelativePath(const std::wstring& path,
     }
     CloseHandle(file);
     return false;
+}
+
+void TestPresetFontSelectionArchivesOnlySelectedFonts() {
+    namespace fs = std::filesystem;
+    fs::path root = fs::temp_directory_path() / L"tooltype-pts-font-selection";
+    std::error_code ignored;
+    fs::remove_all(root, ignored);
+    fs::create_directories(root);
+
+    std::vector<std::wstring> fontPaths;
+    const wchar_t* names[] = {L"BrandAlpha.ttf", L"BrandBeta.ttf"};
+    for (const wchar_t* name : names) {
+        fs::path font = root / name;
+        {
+            std::ofstream out(font, std::ios::binary);
+            out << "font-payload-0123456789";
+        }
+        fontPaths.push_back(font.wstring());
+    }
+
+    PtsBackupOptions options;
+    options.usePresetFontItems = true;
+    for (size_t i = 0; i < fontPaths.size(); ++i) {
+        PtsBackupItem item{};
+        item.kind = PtsEntryKind::Font;
+        item.sourcePath = fontPaths[i];
+        item.rootToken = L"FONT";
+        item.relativePath = names[i];
+        item.displayName = names[i];
+        item.size = 22;
+        options.presetFontItems.push_back(item);
+    }
+
+    fs::path archive = root / L"fonts.afang";
+    std::wstring summary;
+    std::wstring error;
+    Expect(CreatePtsBackupArchive(archive.wstring(), false, true, options,
+
+                                  [](int, const std::wstring&) {}, summary, error),
+           "preset font backup failed");
+    Expect(error.empty(), "preset font backup reported an error");
+    Expect(ArchiveContainsRelativePath(archive.wstring(), L"BrandAlpha.ttf") &&
+               ArchiveContainsRelativePath(archive.wstring(), L"BrandBeta.ttf"),
+           "preset font backup did not archive the selected fonts");
+    Expect(summary == L"Đã sao lưu 2 font, " + FormatBytes(46) + L".",
+           "preset font backup summary is not the concise font form");
+
+    options.presetFontItems.pop_back();
+    fs::path second = root / L"fonts-one.afang";
+    summary.clear();
+    error.clear();
+    Expect(CreatePtsBackupArchive(second.wstring(), false, true, options,
+
+                                  [](int, const std::wstring&) {}, summary, error),
+           "single preset font backup failed");
+    Expect(ArchiveContainsRelativePath(second.wstring(), L"BrandAlpha.ttf") &&
+               !ArchiveContainsRelativePath(second.wstring(), L"BrandBeta.ttf"),
+           "preset font backup did not follow the selected font list");
+
+    fs::remove_all(root, ignored);
 }
 
 void TestSafeArchivePaths() {
@@ -743,8 +1058,10 @@ void TestCrossVersionArchiveRestore() {
            "cross-version archive restore failed");
     Expect(registryUpdateRequested,
            "cross-version restore did not request the active Photoshop settings path update");
-    Expect(summary.find(L"SettingsFilePath") != std::wstring::npos,
-           "restore summary discarded details needed by the completion dialog");
+    Expect(summary.rfind(L"Đã khôi phục ", 0) == 0 &&
+               summary.find(L"Adobe Photoshop 2025 → Adobe Photoshop CS6") !=
+                   std::wstring::npos,
+           "restore summary lost the concise headline and version mapping");
 
     fs::path primary = settingsRoot / L"WorkSpaces" / L"Editing.psw";
     fs::path modified = settingsRoot / L"WorkSpaces (Modified)" / L"Editing.psw";
@@ -1573,6 +1890,14 @@ int main() {
     try {
         TestPtsPopupLayoutIsOpaqueReadableAndDpiScaled();
         TestCompactPtsNoticeMarksOmittedDetails();
+        TestPtsProgressDisplayIsMonotonicAndNeverStale();
+        TestCompactPtsNoticeKeepsTypicalPhaseMessage();
+        TestPtsCompletionSummariesAreConcise();
+        TestFontSelectionPopupHelpers();
+        TestFontPickDialogLayoutIsDpiScaledAndSeparated();
+        TestHoverEffectIsNotRetainedAfterClick();
+        TestDeleteInstalledFontRemovesRegistryEntryAndFile();
+        TestPresetFontSelectionArchivesOnlySelectedFonts();
         TestSafeArchivePaths();
         TestCompressionRoundTrip();
         TestArchiveInspectionReportsProgress();
